@@ -1275,7 +1275,7 @@ class ExplainerDashboard:
 
                 serve(app.server, host=host, port=port)
             else:
-                app.run_server(port=port, host=host, **kwargs)
+                app.run(port=port, host=host, **kwargs)
         else:
             if self.mode == "dash":
                 print(
