@@ -1272,10 +1272,12 @@ class ExplainerDashboard:
             )
             if use_waitress:
                 from waitress import serve
-
                 serve(app.server, host=host, port=port)
             else:
-                app.run_server(port=port, host=host, **kwargs)
+                try:
+                    app.run(port=port, host=host, **kwargs)
+                except AttributeError:
+                    app.run_server(port=port, host=host, **kwargs)
         else:
             if self.mode == "dash":
                 print(
