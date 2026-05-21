@@ -116,9 +116,6 @@ def test_X_cats(precalculated_catboost_regression_explainer):
     assert isinstance(precalculated_catboost_regression_explainer.X_cats, pd.DataFrame)
 
 
-
-
-
 def test_mean_abs_shap_df(precalculated_catboost_regression_explainer):
     assert isinstance(
         precalculated_catboost_regression_explainer.get_mean_abs_shap_df(), pd.DataFrame
@@ -251,6 +248,19 @@ def test_pdp_df(precalculated_catboost_regression_explainer):
     assert isinstance(
         precalculated_catboost_regression_explainer.pdp_df("Sex", index=0), pd.DataFrame
     )
+
+
+def test_pdp_df_handles_nan_in_categorical_xrow(
+    precalculated_catboost_regression_explainer,
+):
+    explainer = precalculated_catboost_regression_explainer
+    X_row = explainer.X.iloc[[0]].copy()
+
+    for col in explainer.categorical_cols:
+        X_row[col] = np.nan
+
+    pdp_df = explainer.pdp_df("Age", X_row=X_row)
+    assert isinstance(pdp_df, pd.DataFrame)
 
 
 def test_plot_importances(precalculated_catboost_regression_explainer):

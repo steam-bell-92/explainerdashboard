@@ -3,8 +3,12 @@ import pytest
 import numpy as np
 import pandas as pd
 from sklearn.datasets import make_classification, make_regression
-from torch import nn
 
+# Skip entire module if torch/skorch not available
+pytest.importorskip("torch", reason="torch not available (e.g., on Intel Mac)")
+pytest.importorskip("skorch", reason="skorch not available (e.g., on Intel Mac)")
+
+from torch import nn
 from skorch import NeuralNetClassifier, NeuralNetRegressor
 
 from explainerdashboard.explainers import RegressionExplainer, ClassifierExplainer

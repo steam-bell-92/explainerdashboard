@@ -28,11 +28,14 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
-import plotly.graph_objs as go
+import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-
-from .explainer_methods import matching_cols, safe_isinstance
+from .explainer_methods import (
+    matching_cols,
+    safe_isinstance,
+    sorted_categorical_values,
+)
 
 
 def plotly_prediction_piechart(predictions_df, showlegend=True, size=250):
@@ -348,8 +351,7 @@ def plotly_precision_plot(precision_df, cutoff=None, labels=None, pos_label=None
         title=f"percentage {label} vs predicted probability",
         yaxis=dict(title="counts"),
         yaxis2=dict(
-            title="percentage",
-            titlefont=dict(color="rgb(148, 103, 189)"),
+            title=dict(text="percentage", font=dict(color="rgb(148, 103, 189)")),
             tickfont=dict(color="rgb(148, 103, 189)"),
             overlaying="y",
             side="right",
@@ -410,9 +412,10 @@ def plotly_classification_plot(
     col_sums = classification_df.sum(axis=0)
 
     for label, below, above, total in classification_df.itertuples():
-        below_perc = 100 * below / col_sums["below"]
-        above_perc = 100 * above / col_sums["above"]
-        total_perc = 100 * total / col_sums["total"]
+        # Avoid divide by zero warnings
+        below_perc = 100 * below / col_sums["below"] if col_sums["below"] > 0 else 0.0
+        above_perc = 100 * above / col_sums["above"] if col_sums["above"] > 0 else 0.0
+        total_perc = 100 * total / col_sums["total"] if col_sums["total"] > 0 else 0.0
         if percentage:
             fig.add_trace(
                 go.Bar(
@@ -829,9 +832,9 @@ def plotly_dependence_plot(
     Returns:
         Plotly fig
     """
-    assert len(X_col) == len(shap_values), (
-        f"Column(len={len(X_col)}) and Shap values(len={len(shap_values)}) and should have the same length!"
-    )
+    assert (
+        len(X_col) == len(shap_values)
+    ), f"Column(len={len(X_col)}) and Shap values(len={len(shap_values)}) and should have the same length!"
     if idxs is not None:
         assert len(idxs) == X_col.shape[0]
         idxs = pd.Index(idxs).astype(str)
@@ -843,9 +846,9 @@ def plotly_dependence_plot(
             highlight_idx = highlight_index
             highlight_name = idxs[highlight_idx]
         elif isinstance(highlight_index, str):
-            assert highlight_index in idxs, (
-                f"highlight_index should be int or in idxs, {highlight_index} is neither!"
-            )
+            assert (
+                highlight_index in idxs
+            ), f"highlight_index should be int or in idxs, {highlight_index} is neither!"
             highlight_idx = idxs.get_loc(highlight_index)
             highlight_name = highlight_index
 
@@ -1036,12 +1039,12 @@ def plotly_shap_violin_plot(
         Plotly fig
     """
 
-    assert not is_numeric_dtype(X_col), (
-        f"{X_col.name} is not categorical! Can only plot violin plots for categorical features!"
-    )
+    assert not is_numeric_dtype(
+        X_col
+    ), f"{X_col.name} is not categorical! Can only plot violin plots for categorical features!"
 
     if cats_order is None:
-        cats_order = sorted(X_col.unique().tolist())
+        cats_order = sorted_categorical_values(X_col.unique().tolist())
 
     n_cats = len(cats_order)
 
@@ -1056,9 +1059,9 @@ def plotly_shap_violin_plot(
             highlight_idx = highlight_index
             highlight_name = idxs[highlight_idx]
         elif isinstance(highlight_index, str):
-            assert highlight_index in idxs, (
-                f"highlight_index should be int or in idxs, {highlight_index} is neither!"
-            )
+            assert (
+                highlight_index in idxs
+            ), f"highlight_index should be int or in idxs, {highlight_index} is neither!"
             highlight_idx = idxs.get_loc(highlight_index)
             highlight_name = highlight_index
 
@@ -1099,7 +1102,11 @@ def plotly_shap_violin_plot(
 
     for i, cat in enumerate(cats_order):
         col = 1 + i * 2 if points or X_color_col is not None else 1 + i
-        if cat.startswith(X_col.name + "_"):
+        if (
+            isinstance(cat, str)
+            and isinstance(X_col.name, str)
+            and cat.startswith(X_col.name + "_")
+        ):
             cat_name = cat[len(X_col.name) + 1 :]
         else:
             cat_name = cat
@@ -1355,7 +1362,6 @@ def plotly_pdp(
     if plot_lines:
         x = pdp_df.columns.values
         pdp_sample = pdp_df.sample(min(num_grid_lines, len(pdp_df)))
-
 
         for row in pdp_sample.itertuples(index=False):
             data.append(
@@ -1901,9 +1907,9 @@ def plotly_shap_scatter_plot(
     Returns:
         Plotly fig
     """
-    assert matching_cols(X, shap_values_df), (
-        "X and shap_values_df should have matching columns!"
-    )
+    assert matching_cols(
+        X, shap_values_df
+    ), "X and shap_values_df should have matching columns!"
     if display_columns is None:
         display_columns = X.columns.tolist()
     if idxs is not None:
@@ -1916,9 +1922,9 @@ def plotly_shap_scatter_plot(
     length = len(X)
     if highlight_index is not None:
         if isinstance(highlight_index, int):
-            assert highlight_index >= 0 and highlight_index < len(X), (
-                "if highlight_index is int, then should be between 0 and {len(X)}!"
-            )
+            assert highlight_index >= 0 and highlight_index < len(
+                X
+            ), "if highlight_index is int, then should be between 0 and {len(X)}!"
             highlight_idx = highlight_index
             highlight_index = idxs[highlight_idx]
         elif isinstance(highlight_index, str):
@@ -2201,10 +2207,16 @@ def plotly_plot_residuals(
         idxs = [str(i) for i in range(len(preds))]
 
     res = y - preds
-    res_ratio = y / preds
+    # Avoid divide by zero warnings: use np.divide with where to handle zero preds
+    res_ratio = np.divide(
+        y, preds, out=np.full_like(y, np.nan, dtype=float), where=preds != 0
+    )
 
     if residuals == "log-ratio":
-        residuals_display = np.log(res_ratio)
+        # Avoid log(0) or log(inf) warnings by filtering out invalid values
+        valid_mask = (res_ratio > 0) & np.isfinite(res_ratio)
+        residuals_display = np.full_like(res_ratio, np.nan, dtype=float)
+        residuals_display[valid_mask] = np.log(res_ratio[valid_mask])
         residuals_name = "residuals log ratio<br>(log(y/preds))"
     elif residuals == "ratio":
         residuals_display = res_ratio
@@ -2313,10 +2325,16 @@ def plotly_residuals_vs_col(
         idxs = [str(i) for i in range(len(preds))]
 
     res = y - preds
-    res_ratio = y / preds
+    # Avoid divide by zero warnings: use np.divide with where to handle zero preds
+    res_ratio = np.divide(
+        y, preds, out=np.full_like(y, np.nan, dtype=float), where=preds != 0
+    )
 
     if residuals == "log-ratio":
-        residuals_display = np.log(res_ratio)
+        # Avoid log(0) or log(inf) warnings by filtering out invalid values
+        valid_mask = (res_ratio > 0) & np.isfinite(res_ratio)
+        residuals_display = np.full_like(res_ratio, np.nan, dtype=float)
+        residuals_display[valid_mask] = np.log(res_ratio[valid_mask])
         residuals_name = "residuals log ratio<br>(log(y/preds))"
     elif residuals == "ratio":
         residuals_display = res_ratio
@@ -2337,7 +2355,7 @@ def plotly_residuals_vs_col(
 
     if not is_numeric_dtype(col):
         if cats_order is None:
-            cats_order = sorted(col.unique().tolist())
+            cats_order = sorted_categorical_values(col.unique().tolist())
         n_cats = len(cats_order)
 
         if points:
@@ -2496,7 +2514,7 @@ def plotly_actual_vs_col(
 
     if not is_numeric_dtype(col):
         if cats_order is None:
-            cats_order = sorted(col.unique().tolist())
+            cats_order = sorted_categorical_values(col.unique().tolist())
         n_cats = len(cats_order)
 
         if points:
@@ -2648,7 +2666,7 @@ def plotly_preds_vs_col(
 
     if not is_numeric_dtype(col):
         if cats_order is None:
-            cats_order = sorted(col.unique().tolist())
+            cats_order = sorted_categorical_values(col.unique().tolist())
         n_cats = len(cats_order)
 
         if points:
@@ -2786,9 +2804,9 @@ def plotly_rf_trees(
 
     colors = ["blue"] * len(model.estimators_)
     if highlight_tree is not None:
-        assert highlight_tree >= 0 and highlight_tree <= len(model.estimators_), (
-            f"{highlight_tree} is out of range (0, {len(model.estimators_)})"
-        )
+        assert highlight_tree >= 0 and highlight_tree <= len(
+            model.estimators_
+        ), f"{highlight_tree} is out of range (0, {len(model.estimators_)})"
         colors[highlight_tree] = "red"
     warnings.filterwarnings("ignore", category=UserWarning)
     if safe_isinstance(model, "RandomForestClassifier", "ExtraTreesClassifier"):
@@ -2912,6 +2930,7 @@ def plotly_xgboost_trees(
     target="",
     units="",
     higher_is_better=True,
+    model_name="xgboost",
 ):
     """Generate a plot showing the prediction of every single tree inside an XGBoost model
 
@@ -2926,6 +2945,8 @@ def plotly_xgboost_trees(
         units (str, optional): Units of target variable. Defaults to "".
         higher_is_better (bool, optional): up is green, down is red. If False then
             flip the colors.
+        model_name (str, optional): model family label used in chart titles.
+            Defaults to "xgboost".
 
     Returns:
         Plotly fig
@@ -3023,10 +3044,10 @@ def plotly_xgboost_trees(
     )
 
     if target:
-        title = f"Individual xgboost decision trees predicting {target}"
+        title = f"Individual {model_name} decision trees predicting {target}"
         yaxis_title = f"Predicted {target} {f'({units})' if units else ''}"
     else:
-        title = "Individual xgboost decision trees"
+        title = f"Individual {model_name} decision trees"
         yaxis_title = f"Predicted outcome ({units})" if units else "Predicted outcome"
 
     layout = go.Layout(

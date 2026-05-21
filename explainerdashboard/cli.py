@@ -4,6 +4,9 @@ Command-line tool for starting an explainerdashboard from a particular directory
 
 import os
 import webbrowser
+import logging
+import sys
+import warnings
 from pathlib import Path
 import pickle
 import oyaml as yaml
@@ -17,23 +20,43 @@ from explainerdashboard import *
 from explainerdashboard.explainers import BaseExplainer
 from explainerdashboard.dashboards import ExplainerDashboard
 
+logger = logging.getLogger("explainerdashboard")
+
+
+def _configure_cli_logging():
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        handler = logging.StreamHandler(stream=sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    warnings.simplefilter("default")
+    warnings.showwarning = (
+        lambda message,
+        category,
+        filename,
+        lineno,
+        file=None,
+        line=None: logger.warning("%s", message)
+    )
+
 
 explainer_ascii = r"""
 
  _____ ___ __| |__ _(_)_ _  ___ _ _ __| |__ _ __| |_ | |__  ___  __ _ _ _ __| |
 / -_) \ / '_ \ / _` | | ' \/ -_) '_/ _` / _` (_-< ' \| '_ \/ _ \/ _` | '_/ _` |
 \___/_\_\ .__/_\__,_|_|_||_\___|_| \__,_\__,_/__/_||_|_.__/\___/\__,_|_| \__,_|
-        |_| 
+        |_|
 
 """
 
 hub_ascii = r"""
 
-               _      _              _        _    
-  _____ ___ __| |__ _(_)_ _  ___ _ _| |_ _  _| |__ 
+               _      _              _        _
+  _____ ___ __| |__ _(_)_ _  ___ _ _| |_ _  _| |__
  / -_) \ / '_ \ / _` | | ' \/ -_) '_| ' \ || | '_ \
  \___/_\_\ .__/_\__,_|_|_||_\___|_| |_||_\_,_|_.__/
-         |_|                                      
+         |_|
 
 """
 
@@ -45,15 +68,15 @@ def build_explainer(explainer_config):
         config = yaml.safe_load(open(str(explainer_config), "r"))
     elif isinstance(explainer_config, dict):
         config = explainer_config
-    assert "explainer" in config, (
-        "Please pass a proper explainer.yaml config file that starts with `explainer:`!"
-    )
+    assert (
+        "explainer" in config
+    ), "Please pass a proper explainer.yaml config file that starts with `explainer:`!"
     config = explainer_config["explainer"]
 
-    print(f"explainerdashboard ===> Loading model from {config['modelfile']}")
+    logger.info("explainerdashboard ===> Loading model from %s", config["modelfile"])
     model = pickle.load(open(config["modelfile"], "rb"))
 
-    print(f"explainerdashboard ===> Loading data from {config['datafile']}")
+    logger.info("explainerdashboard ===> Loading data from %s", config["datafile"])
     if str(config["datafile"]).endswith(".csv"):
         df = pd.read_csv(config["datafile"])
     elif str(config["datafile"]).endswith(".parquet"):
@@ -61,16 +84,18 @@ def build_explainer(explainer_config):
     else:
         raise ValueError("datafile should either be a .csv or .parquet!")
 
-    print(
-        f"explainerdashboard ===> Using column {config['data_target']} to generate X, y "
+    logger.info(
+        "explainerdashboard ===> Using column %s to generate X, y",
+        config["data_target"],
     )
     target_col = config["data_target"]
     X = df.drop(target_col, axis=1)
     y = df[target_col]
 
     if config["data_index"] is not None:
-        print(
-            f"explainerdashboard ===> Generating index from column {config['data_index']}"
+        logger.info(
+            "explainerdashboard ===> Generating index from column %s",
+            config["data_index"],
         )
         assert config["data_index"] in X.columns, (
             f"Cannot find data_index column ({config['data_index']})"
@@ -82,10 +107,10 @@ def build_explainer(explainer_config):
     params = config["params"]
 
     if config["explainer_type"] == "classifier":
-        print("explainerdashboard ===> Generating ClassifierExplainer...")
+        logger.info("explainerdashboard ===> Generating ClassifierExplainer...")
         explainer = ClassifierExplainer(model, X, y, **params)
     elif config["explainer_type"] == "regression":
-        print("explainerdashboard ===> Generating RegressionExplainer...")
+        logger.info("explainerdashboard ===> Generating RegressionExplainer...")
         explainer = ClassifierExplainer(model, X, y, **params)
     return explainer
 
@@ -125,7 +150,15 @@ def build_and_dump_explainer(explainer_config, dashboard_config=None):
     return
 
 
-def launch_dashboard_from_pkl(explainer_filepath, no_browser, port, no_dashboard=False):
+def launch_dashboard_from_pkl(
+    explainer_filepath,
+    no_browser,
+    port,
+    sagemaker=False,
+    routes_pathname_prefix=None,
+    requests_pathname_prefix=None,
+    no_dashboard=False,
+):
     explainer = BaseExplainer.from_file(explainer_filepath)
 
     if port is None:
@@ -134,7 +167,13 @@ def launch_dashboard_from_pkl(explainer_filepath, no_browser, port, no_dashboard
         )
         port = 8050
 
-    db = ExplainerDashboard(explainer, port=port)
+    db = ExplainerDashboard(
+        explainer,
+        port=port,
+        sagemaker=sagemaker,
+        routes_pathname_prefix=routes_pathname_prefix,
+        requests_pathname_prefix=requests_pathname_prefix,
+    )
 
     if not no_browser and not os.environ.get("WERKZEUG_RUN_MAIN"):
         webbrowser.open_new(f"http://127.0.0.1:{port}/")
@@ -144,7 +183,15 @@ def launch_dashboard_from_pkl(explainer_filepath, no_browser, port, no_dashboard
     return
 
 
-def launch_dashboard_from_yaml(dashboard_config, no_browser, port, no_dashboard=False):
+def launch_dashboard_from_yaml(
+    dashboard_config,
+    no_browser,
+    port,
+    sagemaker=False,
+    routes_pathname_prefix=None,
+    requests_pathname_prefix=None,
+    no_dashboard=False,
+):
     if isinstance(dashboard_config, (Path, str)) and str(dashboard_config).endswith(
         ".yaml"
     ):
@@ -169,8 +216,6 @@ def launch_dashboard_from_yaml(dashboard_config, no_browser, port, no_dashboard=
         f"explainerdashboard ===> Building dashboard from {config['dashboard']['explainerfile']}"
     )
 
-    db = ExplainerDashboard.from_config(config)
-
     if port is None:
         port = config["dashboard"]["params"]["port"]
         if port is None:
@@ -178,6 +223,16 @@ def launch_dashboard_from_yaml(dashboard_config, no_browser, port, no_dashboard=
         click.echo(
             f"explainerdashboard ===> Setting port to {port}, override with e.g. --port 8051"
         )
+
+    update_params = {"port": port}
+    if sagemaker:
+        update_params["sagemaker"] = True
+    if routes_pathname_prefix is not None:
+        update_params["routes_pathname_prefix"] = routes_pathname_prefix
+    if requests_pathname_prefix is not None:
+        update_params["requests_pathname_prefix"] = requests_pathname_prefix
+
+    db = ExplainerDashboard.from_config(config, **update_params)
 
     if not no_browser and not os.environ.get("WERKZEUG_RUN_MAIN"):
         click.echo(
@@ -303,6 +358,7 @@ def explainerdashboard_cli(ctx):
         explainerdashboard build
 
     """
+    _configure_cli_logging()
 
 
 @explainerdashboard_cli.command(help="run dashboard and open browser")
@@ -318,7 +374,30 @@ def explainerdashboard_cli(ctx):
 @click.option(
     "--port", "-p", "port", default=None, help="port to run dashboard on defaults."
 )
-def run(ctx, explainer_filepath, no_browser, port):
+@click.option(
+    "--sagemaker",
+    is_flag=True,
+    help="Apply SageMaker Studio proxy defaults for Dash routing.",
+)
+@click.option(
+    "--routes-pathname-prefix",
+    default=None,
+    help="Dash routes_pathname_prefix override.",
+)
+@click.option(
+    "--requests-pathname-prefix",
+    default=None,
+    help="Dash requests_pathname_prefix override.",
+)
+def run(
+    ctx,
+    explainer_filepath,
+    no_browser,
+    port,
+    sagemaker,
+    routes_pathname_prefix,
+    requests_pathname_prefix,
+):
     click.echo(explainer_ascii)
     if explainer_filepath is None:
         if (Path().cwd() / "dashboard.yaml").exists():
@@ -338,10 +417,24 @@ def run(ctx, explainer_filepath, no_browser, port):
         or str(explainer_filepath).endswith(".pickle")
         or str(explainer_filepath).endswith(".dill")
     ):
-        launch_dashboard_from_pkl(explainer_filepath, no_browser, port)
+        launch_dashboard_from_pkl(
+            explainer_filepath,
+            no_browser,
+            port,
+            sagemaker,
+            routes_pathname_prefix,
+            requests_pathname_prefix,
+        )
         return
     elif str(explainer_filepath).endswith(".yaml"):
-        launch_dashboard_from_yaml(explainer_filepath, no_browser, port)
+        launch_dashboard_from_yaml(
+            explainer_filepath,
+            no_browser,
+            port,
+            sagemaker,
+            routes_pathname_prefix,
+            requests_pathname_prefix,
+        )
     else:
         click.echo(
             "Please pass a proper argument to explainerdashboard run"
@@ -385,11 +478,12 @@ def build(ctx, explainer_filepath, dashboard_filepath):
         else:
             dashboard_config = None
 
-        print(
-            f"explainerdashboard ===> Building {explainer_config['explainer']['explainerfile']}"
+        logger.info(
+            "explainerdashboard ===> Building %s",
+            explainer_config["explainer"]["explainerfile"],
         )
         build_and_dump_explainer(explainer_config, dashboard_config)
-        print("explainerdashboard ===> Build finished!")
+        logger.info("explainerdashboard ===> Build finished!")
         return
 
 

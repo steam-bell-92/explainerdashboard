@@ -7,8 +7,26 @@ from pandas.api.types import is_numeric_dtype
 
 import plotly.graph_objects as go
 
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier
+
 from explainerdashboard import ClassifierExplainer, ExplainerDashboard
 from explainerdashboard.explainer_methods import IndexNotFoundError
+
+
+class DataFramePredictProbaWrapper:
+    def __init__(self, model):
+        self.model = model
+        self.classes_ = model.classes_
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        probas = self.model.predict_proba(X)
+        return pd.DataFrame(
+            probas, columns=self.classes_, index=getattr(X, "index", None)
+        )
 
 
 def test_explainer_with_dataframe_y(fitted_rf_classifier_model, classifier_data):
@@ -67,6 +85,43 @@ def test_random_index(precalculated_rf_classifier_explainer):
     )
 
 
+def test_random_index_with_numeric_feature_filter(
+    precalculated_rf_classifier_explainer,
+):
+    age = precalculated_rf_classifier_explainer.get_col("Age").dropna()
+    age_min = age.quantile(0.4)
+    age_max = age.quantile(0.6)
+
+    idx = precalculated_rf_classifier_explainer.random_index(
+        feature_filters={"Age": (age_min, age_max)},
+        return_str=True,
+    )
+
+    assert idx is not None
+    sampled_age = precalculated_rf_classifier_explainer.get_col("Age").iloc[
+        precalculated_rf_classifier_explainer.get_idx(idx)
+    ]
+    assert age_min <= sampled_age <= age_max
+
+
+def test_random_index_with_categorical_feature_filter(
+    precalculated_rf_classifier_explainer,
+):
+    gender_col = precalculated_rf_classifier_explainer.get_col("Gender").dropna()
+    gender_value = gender_col.iloc[0]
+
+    idx = precalculated_rf_classifier_explainer.random_index(
+        feature_filters={"Gender": [gender_value]},
+        return_str=True,
+    )
+
+    assert idx is not None
+    sampled_gender = precalculated_rf_classifier_explainer.get_col("Gender").iloc[
+        precalculated_rf_classifier_explainer.get_idx(idx)
+    ]
+    assert sampled_gender == gender_value
+
+
 def test_index_exists(precalculated_rf_classifier_explainer):
     assert precalculated_rf_classifier_explainer.index_exists(0)
     assert precalculated_rf_classifier_explainer.index_exists(
@@ -86,6 +141,37 @@ def test_cats_notencoded(precalculated_rf_classifier_explainer):
         .item()
         == "No Gender"
     )
+
+
+def test_string_labels_supported(classifier_data):
+    X_train, y_train, X_test, y_test = classifier_data
+    labels = ["No", "Yes"]
+    label_map = {
+        value: labels[idx] for idx, value in enumerate(sorted(y_train.unique()))
+    }
+    y_train_str = y_train.map(label_map)
+    y_test_str = y_test.map(label_map)
+
+    model = RandomForestClassifier(n_estimators=50, random_state=0)
+    model.fit(X_train, y_train_str)
+
+    explainer = ClassifierExplainer(model, X_test, y_test_str)
+    lift_df = explainer.get_liftcurve_df()
+
+    assert explainer.labels == list(model.classes_)
+    assert set(explainer.y.unique()).issubset(set(range(len(explainer.labels))))
+    assert {"pred_proba", "y"}.issubset(lift_df.columns)
+
+
+def test_calibrated_classifiercv_uses_tree_shap(classifier_data):
+    X_train, y_train, X_test, y_test = classifier_data
+    base_estimator = RandomForestClassifier(n_estimators=25, random_state=0)
+    model = CalibratedClassifierCV(estimator=base_estimator, cv=2)
+    model.fit(X_train, y_train)
+
+    explainer = ClassifierExplainer(model, X_test, y_test)
+
+    assert explainer.shap == "tree"
 
 
 def test_row_from_input(precalculated_rf_classifier_explainer):
@@ -213,6 +299,25 @@ def test_contrib_df(precalculated_rf_classifier_explainer):
     )
 
 
+def test_contrib_df_accepts_list_or_array_X_row(precalculated_rf_classifier_explainer):
+    merged_row_df = precalculated_rf_classifier_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    contrib_df_from_df = precalculated_rf_classifier_explainer.get_contrib_df(
+        X_row=merged_row_df
+    )
+    contrib_df_from_list = precalculated_rf_classifier_explainer.get_contrib_df(
+        X_row=merged_row_list
+    )
+    contrib_df_from_array = precalculated_rf_classifier_explainer.get_contrib_df(
+        X_row=merged_row_array
+    )
+
+    pd.testing.assert_frame_equal(contrib_df_from_list, contrib_df_from_df)
+    pd.testing.assert_frame_equal(contrib_df_from_array, contrib_df_from_df)
+
+
 def test_contrib_summary_df(precalculated_rf_classifier_explainer):
     assert isinstance(
         precalculated_rf_classifier_explainer.get_contrib_summary_df(0), pd.DataFrame
@@ -276,8 +381,6 @@ def test_shap_interaction_values(precalculated_rf_classifier_explainer):
     )
 
 
-
-
 def test_calculate_properties(precalculated_rf_classifier_explainer):
     precalculated_rf_classifier_explainer.calculate_properties()
 
@@ -300,6 +403,41 @@ def test_prediction_result_df(precalculated_rf_classifier_explainer):
     assert isinstance(df, pd.DataFrame)
 
 
+def test_prediction_result_df_accepts_list_or_array_X_row(
+    precalculated_rf_classifier_explainer,
+):
+    merged_row_df = precalculated_rf_classifier_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    df_from_df = precalculated_rf_classifier_explainer.prediction_result_df(
+        X_row=merged_row_df
+    )
+    df_from_list = precalculated_rf_classifier_explainer.prediction_result_df(
+        X_row=merged_row_list
+    )
+    df_from_array = precalculated_rf_classifier_explainer.prediction_result_df(
+        X_row=merged_row_array
+    )
+
+    pd.testing.assert_frame_equal(df_from_list, df_from_df)
+    pd.testing.assert_frame_equal(df_from_array, df_from_df)
+
+
+def test_prediction_result_df_with_dataframe_predict_proba(
+    fitted_rf_classifier_model, classifier_data
+):
+    _, _, X_test, y_test = classifier_data
+    wrapped_model = DataFramePredictProbaWrapper(fitted_rf_classifier_model)
+    explainer = ClassifierExplainer(wrapped_model, X_test.head(50), y_test.head(50))
+
+    df = explainer.prediction_result_df(0)
+    _, prediction = explainer.get_col_value_plus_prediction("Age", index=0)
+
+    assert isinstance(df, pd.DataFrame)
+    assert np.isscalar(prediction)
+
+
 def test_pdp_df(precalculated_rf_classifier_explainer):
     assert isinstance(precalculated_rf_classifier_explainer.pdp_df("Age"), pd.DataFrame)
     assert isinstance(
@@ -320,6 +458,56 @@ def test_pdp_df(precalculated_rf_classifier_explainer):
         ),
         pd.DataFrame,
     )
+
+
+def test_pdp_df_accepts_list_or_array_X_row(precalculated_rf_classifier_explainer):
+    merged_row_df = precalculated_rf_classifier_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    pdp_from_df = precalculated_rf_classifier_explainer.pdp_df(
+        "Age", X_row=merged_row_df
+    )
+    pdp_from_list = precalculated_rf_classifier_explainer.pdp_df(
+        "Age", X_row=merged_row_list
+    )
+    pdp_from_array = precalculated_rf_classifier_explainer.pdp_df(
+        "Age", X_row=merged_row_array
+    )
+
+    assert list(pdp_from_list.columns) == list(pdp_from_df.columns)
+    assert list(pdp_from_array.columns) == list(pdp_from_df.columns)
+    pd.testing.assert_series_equal(pdp_from_list.iloc[0], pdp_from_df.iloc[0])
+    pd.testing.assert_series_equal(pdp_from_array.iloc[0], pdp_from_df.iloc[0])
+
+
+def test_get_col_value_plus_prediction_accepts_list_or_array_X_row(
+    precalculated_rf_classifier_explainer,
+):
+    merged_row_df = precalculated_rf_classifier_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    value_from_df, pred_from_df = (
+        precalculated_rf_classifier_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_df
+        )
+    )
+    value_from_list, pred_from_list = (
+        precalculated_rf_classifier_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_list
+        )
+    )
+    value_from_array, pred_from_array = (
+        precalculated_rf_classifier_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_array
+        )
+    )
+
+    assert value_from_list == value_from_df
+    assert value_from_array == value_from_df
+    assert pred_from_list == pytest.approx(pred_from_df)
+    assert pred_from_array == pytest.approx(pred_from_df)
 
 
 def test_memory_usage(precalculated_rf_classifier_explainer):

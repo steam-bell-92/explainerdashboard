@@ -1,8 +1,20 @@
+import pytest
 import pandas as pd
 import numpy as np
 from pandas.api.types import is_numeric_dtype
 
 import plotly.graph_objects as go
+
+from explainerdashboard import RegressionExplainer
+
+
+class DataFramePredictWrapper:
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, X):
+        preds = self.model.predict(X)
+        return pd.DataFrame({"prediction": preds}, index=getattr(X, "index", None))
 
 
 def test_explainer_len(precalculated_rf_regression_explainer, testlen):
@@ -18,6 +30,25 @@ def test_random_index(precalculated_rf_regression_explainer):
     assert isinstance(
         precalculated_rf_regression_explainer.random_index(return_str=True), str
     )
+
+
+def test_random_index_with_numeric_feature_filter(
+    precalculated_rf_regression_explainer,
+):
+    age = precalculated_rf_regression_explainer.get_col("Age").dropna()
+    age_min = age.quantile(0.4)
+    age_max = age.quantile(0.6)
+
+    idx = precalculated_rf_regression_explainer.random_index(
+        feature_filters={"Age": (age_min, age_max)},
+        return_str=True,
+    )
+
+    assert idx is not None
+    sampled_age = precalculated_rf_regression_explainer.get_col("Age").iloc[
+        precalculated_rf_regression_explainer.get_idx(idx)
+    ]
+    assert age_min <= sampled_age <= age_max
 
 
 def test_index_exists(precalculated_rf_regression_explainer):
@@ -53,6 +84,68 @@ def test_row_from_input(precalculated_rf_regression_explainer):
 def test_prediction_result_df(precalculated_rf_regression_explainer):
     df = precalculated_rf_regression_explainer.prediction_result_df(0)
     assert isinstance(df, pd.DataFrame)
+
+
+def test_prediction_result_df_accepts_list_or_array_X_row(
+    precalculated_rf_regression_explainer,
+):
+    merged_row_df = precalculated_rf_regression_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    df_from_df = precalculated_rf_regression_explainer.prediction_result_df(
+        X_row=merged_row_df
+    )
+    df_from_list = precalculated_rf_regression_explainer.prediction_result_df(
+        X_row=merged_row_list
+    )
+    df_from_array = precalculated_rf_regression_explainer.prediction_result_df(
+        X_row=merged_row_array
+    )
+
+    pd.testing.assert_frame_equal(df_from_list, df_from_df)
+    pd.testing.assert_frame_equal(df_from_array, df_from_df)
+
+
+def test_get_col_value_plus_prediction_with_dataframe_predict(
+    fitted_rf_regression_model, regression_data
+):
+    _, _, X_test, y_test = regression_data
+    wrapped_model = DataFramePredictWrapper(fitted_rf_regression_model)
+    explainer = RegressionExplainer(wrapped_model, X_test.head(50), y_test.head(50))
+
+    _, prediction = explainer.get_col_value_plus_prediction("Age", index=0)
+
+    assert np.isscalar(prediction)
+
+
+def test_get_col_value_plus_prediction_accepts_list_or_array_X_row(
+    precalculated_rf_regression_explainer,
+):
+    merged_row_df = precalculated_rf_regression_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    value_from_df, pred_from_df = (
+        precalculated_rf_regression_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_df
+        )
+    )
+    value_from_list, pred_from_list = (
+        precalculated_rf_regression_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_list
+        )
+    )
+    value_from_array, pred_from_array = (
+        precalculated_rf_regression_explainer.get_col_value_plus_prediction(
+            "Age", X_row=merged_row_array
+        )
+    )
+
+    assert value_from_list == value_from_df
+    assert value_from_array == value_from_df
+    assert pred_from_list == pytest.approx(pred_from_df)
+    assert pred_from_array == pytest.approx(pred_from_df)
 
 
 def test_preds(precalculated_rf_regression_explainer):
@@ -269,6 +362,27 @@ def test_pdp_df(precalculated_rf_regression_explainer):
     assert isinstance(
         precalculated_rf_regression_explainer.pdp_df("Gender", index=0), pd.DataFrame
     )
+
+
+def test_pdp_df_accepts_list_or_array_X_row(precalculated_rf_regression_explainer):
+    merged_row_df = precalculated_rf_regression_explainer.get_X_row(0, merge=True)
+    merged_row_list = merged_row_df.values[0].tolist()
+    merged_row_array = np.array(merged_row_list, dtype=object)
+
+    pdp_from_df = precalculated_rf_regression_explainer.pdp_df(
+        "Age", X_row=merged_row_df
+    )
+    pdp_from_list = precalculated_rf_regression_explainer.pdp_df(
+        "Age", X_row=merged_row_list
+    )
+    pdp_from_array = precalculated_rf_regression_explainer.pdp_df(
+        "Age", X_row=merged_row_array
+    )
+
+    assert list(pdp_from_list.columns) == list(pdp_from_df.columns)
+    assert list(pdp_from_array.columns) == list(pdp_from_df.columns)
+    pd.testing.assert_series_equal(pdp_from_list.iloc[0], pdp_from_df.iloc[0])
+    pd.testing.assert_series_equal(pdp_from_array.iloc[0], pdp_from_df.iloc[0])
 
 
 def test_plot_importances(precalculated_rf_regression_explainer):

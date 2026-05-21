@@ -1,122 +1,95 @@
-
 # TODO
 
-- add get_descriptions_df tests
-- do multiclass pdp
+**Meta**
+- Last triage: 2026-02-08
+- Owner: @oegedijk
+- Rules: link an issue when possible; include size S/M/L; mark blockers.
 
-- experiment with dash_draggable: https://github.com/MehdiChelh/dash-draggable
-- add set_shap_values tests
-- add hub.to_yaml() dashboard dump option, e.g. 'joblib', 'dill' or 'pkl'
-- add how to create `ExplainerComponent` to docs (see closed issue)
-## Bugs:
+**Done**
+- [S][Methods][#220] get_contrib_df accepts list/array input (and hardened related X_row APIs).
+- [M][Components][#176] FeatureInputComponent hide parameters.
+- [M][Explainers][#198/#340] LightGBM string categorical handling across SHAP/plots.
+- [S][Hub][#146/#342] hub.to_yaml integrate_dashboard_yamls honors pickle_type and dumps integrated explainer artifacts.
+- [M][Explainers][#294] align/explain multiclass logodds between Contributions Plot and Prediction Box (+ PDP highlight and XGBoost decision path wording alignment).
+- [M][Explainers/Methods/Docs][#213] improve sklearn/imblearn pipeline support: feature-name cleanup (`strip_pipeline_prefix`, `feature_name_fn`), auto-detect onehot groups (`auto_detect_pipeline_cats`), accept binary-like scaled onehot columns in `cats`, preserve transformed index, add warnings/docs/tests.
+- [M][Explainers/Methods/Tests/Docs][#256] improve multiclass LinearSVC support/docs with decision_function probability fallback and regression coverage for SHAP/PDP/permutation flows.
+- [M][Explainers/Methods/Components/Tests][#118] add LightGBM tree visualization support (dtreeviz), including tree explainer wiring, dashboard tree tabs, and regression coverage.
 
-## Plots:
-- add hide_legend parameter
-- add SHAP decision plots:
-    https://towardsdatascience.com/introducing-shap-decision-plots-52ed3b4a1cba
-- make plot background transparent?
-- Only use ScatterGl above a certain cutoff
-- seperate standard shap plots for shap_interaction plots 
-    - using some kind of inheritance?
-- change lines and annotation to this:
-    - https://community.plotly.com/t/announcing-plotly-py-4-12-horizontal-and-vertical-lines-and-rectangles/46783
+**Now**
+- [M][Dashboard][#161] more flexible instantiate_component (no explainer needed for non-ExplainerComponents).
 
+**Next**
+- [M] add ExtraTrees and GradientBoostingClassifier to tree visualizers.
 
-### Classifier plots:
-- pdp: add multiclass option
-    - no icelines just mean and index with different thickness
-    - new method?
+**Backlog: Explainers**
+- [M] add plain language explanations for plots (in_words + UI toggle).
+- [S] pass n_jobs to pdp_isolate.
+- [M] add ExtraTrees and GradientBoostingClassifier to tree visualizers.
 
-### Regression plots:
+**Backlog: Dashboard**
+- [S] make poweredby right-aligned.
+- [M][#161] more flexible instantiate_component (no explainer needed for non-ExplainerComponents).
+- [M] add TablePopout.
+- [M][#247] add EDA-style feature histograms/bar charts/correlation graphs.
+- [M/L] add cost calculator/optimizer for classifier models (confusion matrix weights, Youden J).
+- [M/L] add group fairness metrics (see refs in old TODO).
 
-## Explainers:
-- Turn print statements into logging
-- pass n_jobs to pdp_isolate
-- add ExtraTrees and GradientBoostingClassifier to tree visualizers
-- add plain language explanations
-    - could add an parameter to the` explainer.plot_*` function  `in_words=True` in which 
-        case instead of a plot the function returns a verbal description of the 
-        relationship in the plot.
-    - Then add an "in words" button to the components, that show a popup with
-        the verbal explanation.
+**Backlog: Hub**
+- [M] automatic reloads with watchdog.
+- [S] expose reloader/debug options in run().
+- [M][#306] support selecting between multiple explainers from one hub/dashboard.
 
-## notebooks:
+**Backlog: Components**
+- [M][#165/#233] add predictions list to whatif composite.
+- [S] add circular callbacks between cutoff and cutoff percentile.
+- [S] add side-by-side option to cutoff selector component.
+- [M][#249] add filter to index selector using pattern-matching callbacks.
+- [S] add pos_label_name property to PosLabelConnector search.
+- [S] add "number of indexes" indicator to RandomIndexComponents for current restrictions.
+- [M] whatif constraints function with validation feedback.
+- [M] add sliders option to whatif component.
+- [S][#170] allow limiting What-If input editor to selected feature subset.
+- [M][#171] allow optional contextual/image display in Individual Predictions.
 
+**Backlog: Methods**
+- [M] support SamplingExplainer, PartitionExplainer, PermutationExplainer, AdditiveExplainer.
+- [M] support LimeTabularExplainer.
+- [M] investigate method from https://arxiv.org/abs/2006.04750.
+- [M][#229] clarify/add support path for Poisson and Gamma regression explainers.
 
-## Dashboard:
-- Turn print statements into logging
-- make poweredby right align
-- more flexible instantiate_component:
-    - no explainer needed (if explainer component detected, pass otherwise ignore)
-- add TablePopout
-- Add EDA style feature histograms, bar charts, correlation graphs, etc
-- add cost calculator/optimizer for classifier models based on confusion matrix weights
-    - add Youden J's calculation
-- add group fairness metrics
-    - https://arxiv.org/pdf/1910.05591.pdf
-    - https://cran.r-project.org/web/packages/fairmodels/vignettes/Basic_tutorial.html
-    - http://manifold.mlvis.io/
-        - generate groups programmatically!
+**Backlog: Plots**
+- [S] add hide_legend parameter.
+- [M] add SHAP decision plots (ref: https://towardsdatascience.com/introducing-shap-decision-plots-52ed3b4a1cba).
+- [S] make plot background transparent (configurable).
+- [S] use ScatterGL only above a point-count cutoff.
+- [M] separate standard shap plots vs shap_interaction plots (inheritance or new class).
+- [S] update lines/annotations to new Plotly helpers (ref: https://community.plotly.com/t/announcing-plotly-py-4-12-horizontal-and-vertical-lines-and-rectangles/46783).
+- [M] PDP multiclass support end-to-end (data + plots + UI).
 
-## Hub:
-- automatic reloads with watchdog
-- add reloader=None, debug=None, options
-- make example deployment on heroku
-- add to_html option
+**Backlog: Tests**
+- [S] add pipeline with X_background test.
+- [S] test explainer.dump/explainer.from_file with .pkl or .dill.
+- [S] add get_descriptions_df tests (including sort='shap').
+- [S] add set_shap_values test.
+- [S] add set_shap_interaction_values test.
+- [S] add get_idx_sample tests.
+- [S] add y_binary with self.y_missing tests.
+- [S] add percentile_from_cutoff tests.
+- [S] add tests for InterpretML EBM (shap 0.37).
+- [S] add tests for explainerhub CLI add user.
+- [S] test model_output='probability' vs 'raw' vs 'logodds' explicitly.
+- [M] expand explainer_methods tests.
+- [M] add explainer_plots tests.
 
+**Backlog: Docs**
+- [S] retake screenshots of components as cards.
+- [M] add type hints to explainer class methods, explainer_methods, explainer_plots.
+- [S][#280] add guidance on `X` and `X_background` sizing/performance trade-offs.
 
-### Components
-- add predictions list to whatif composite:
-    - https://github.com/oegedijk/explainerdashboard/issues/85
-- add circular callbacks to cutoff - cutoff percentile
-- Add side-by-side option to cutoff selector component
-- add filter to index selector using pattern matching callbacks:
-    - https://dash.plotly.com/pattern-matching-callbacks
-- add pos_label_name property to PosLabelConnector search
-- add "number of indexes" indicator to RandomIndexComponents for current restrictions
-- whatif:
-    - Add a constraints function to whatif component:
-        - tests if current feature input is allowed
-        - gives specific feedback when constraint broken
-        - could build WhatIfComponentException for this?
-    - Add sliders option to what if component
+**Backlog: Library/Infra**
+- [S] example deployment repo (Heroku or alternative).
+- [S] example ExplainerHub deployment repo.
+- [S][#284] publish a public showcase deployment (e.g. Hugging Face Spaces).
 
-## Methods:
-- add support for SamplingExplainer, PartitionExplainer, PermutationExplainer, AdditiveExplainer
-- add support for LimeTabularExplainer:
-    - http://gael-varoquaux.info/interpreting_ml_tuto/content/02_why/04_black_box_interpretation.html
-    - https://shap.readthedocs.io/en/latest/generated/shap.explainers.other.LimeTabular.html
-- Add this method? : https://arxiv.org/abs/2006.04750?
-
-## Tests:
-- add pipeline with X_background test
-- test explainer.dump and explainer.from_file with .pkl or .dill
-- add get_descriptions_df tests -> sort='shap'
-- set_shap_values test
-- set_shap_interaction_values test
-- add cv metrics tests
-- random_index tests
-- get_idx_sample
-- y_binary with self.y_missing
-- percentile_from_cutoff
-- decisiontree
-- add tests for InterpretML EBM (shap 0.37)
-- write tests for explainerhub CLI add user
-- test model_output='probability' and 'raw' or 'logodds' seperately
-- write tests for explainer_methods
-- write tests for explainer_plots
-
-## Docs:
-- retake screenshots of components as cards
-- Add type hints:
-    - to explainer class methods
-    - to explainer_methods
-    - to explainer_plots
-
-
-## Library level:
-- Make example heroku deployment repo
-- Make example heroku ExplainerHub repo
-- submit pull request to shap with broken test for 
-    https://github.com/slundberg/shap/issues/723
-
+**External / Upstream**
+- [M] submit SHAP PR with broken test for https://github.com/slundberg/shap/issues/723.

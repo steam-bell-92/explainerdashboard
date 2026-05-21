@@ -11,12 +11,15 @@ __all__ = [
     "InlineExplainer",
 ]
 
+import os
 import sys
 import re
 import json
 import inspect
 import requests
-from typing import List, Union
+import logging
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Union
 from pathlib import Path
 from copy import deepcopy
 import warnings
@@ -52,10 +55,17 @@ from jupyter_dash import JupyterDash
 
 import plotly.io as pio
 
-from .dashboard_methods import instantiate_component, encode_callables, decode_callables
+from .dashboard_methods import (
+    instantiate_component,
+    encode_callables,
+    decode_callables,
+    ExplainerComponent,
+)
 from .dashboard_components import *
 from .explainers import BaseExplainer
 from . import to_html
+
+logger = logging.getLogger(__name__)
 
 # with pipelines we extract the final model that is fitted on raw numpy arrays and so will throw
 # this error when receiving a pandas dataframe. So we suppress the warnings.
@@ -65,6 +75,20 @@ warnings.filterwarnings(
     r"X has feature names, but \w+ was fitted without feature names",
     UserWarning,
 )
+
+
+def _detect_sagemaker():
+    if Path("/opt/ml/metadata/resource-metadata.json").exists():
+        return True
+    return bool(
+        os.environ.get("SAGEMAKER_REGION")
+        or os.environ.get("SM_MODEL_DIR")
+        or os.environ.get("SAGEMAKER_CONTAINER_LOG_LEVEL")
+    )
+
+
+def _sagemaker_default_prefixes(port):
+    return "/", f"/jupyter/default/proxy/{port}/"
 
 
 class ExplainerTabsLayout(ExplainerComponent):
@@ -120,9 +144,9 @@ class ExplainerTabsLayout(ExplainerComponent):
             instantiate_component(tab, explainer, name=str(i + 1), **kwargs)
             for i, tab in enumerate(tabs)
         ]
-        assert len(self.tabs) > 0, (
-            "When passing a list to tabs, need to pass at least one valid tab!"
-        )
+        assert (
+            len(self.tabs) > 0
+        ), "When passing a list to tabs, need to pass at least one valid tab!"
 
         self.register_components(*self.tabs)
 
@@ -184,7 +208,7 @@ class ExplainerTabsLayout(ExplainerComponent):
                                                 ],
                                                 label="Download",
                                                 color="link",
-                                                right=True,
+                                                align_end=True,
                                             ),
                                         ],
                                         style={
@@ -243,10 +267,20 @@ class ExplainerTabsLayout(ExplainerComponent):
 
     def to_html(self, state_dict=None, add_header=True):
         html = to_html.title(self.title)
-        tabs = {
-            tab.title: tab.to_html(state_dict, add_header=False) for tab in self.tabs
-        }
-        tabs = {tab: html for tab, html in tabs.items() if html != "<div></div>"}
+        tabs = {}
+        for tab in self.tabs:
+            tab_html = tab.to_html(state_dict, add_header=False)
+            if (
+                tab_html == "<div></div>"
+                and tab.__class__.to_html is ExplainerComponent.to_html
+            ):
+                if tab.layout() is not None:
+                    tab_html = to_html.div(
+                        "<p>This tab does not support static HTML export. "
+                        "Run the dashboard to view the full interactive content.</p>"
+                    )
+            if tab_html != "<div></div>":
+                tabs[tab.title] = tab_html
         html += to_html.tabs(tabs)
         if add_header:
             return to_html.add_header(html)
@@ -258,14 +292,15 @@ class ExplainerTabsLayout(ExplainerComponent):
             try:
                 tab.register_callbacks(app)
             except AttributeError:
-                print(f"Warning: {tab} does not have a register_callbacks method!")
+                logger.warning("%s does not have a register_callbacks method!", tab)
 
         if not self.block_selector_callbacks:
             if any([tab.has_pos_label_connector() for tab in self.tabs]):
-                print(
-                    "Warning: detected PosLabelConnectors already in the layout. "
+                warnings.warn(
+                    "Detected PosLabelConnectors already in the layout. "
                     "This may clash with the global pos label selector and generate duplicate callback errors. "
-                    "If so set block_selector_callbacks=True."
+                    "If so set block_selector_callbacks=True.",
+                    UserWarning,
                 )
             self.connector.register_callbacks(app)
 
@@ -302,7 +337,7 @@ class ExplainerTabsLayout(ExplainerComponent):
             try:
                 tab.calculate_dependencies()
             except AttributeError:
-                print(f"Warning: {tab} does not have a calculate_dependencies method!")
+                logger.warning("%s does not have a calculate_dependencies method!", tab)
 
 
 class ExplainerPageLayout(ExplainerComponent):
@@ -461,16 +496,17 @@ class ExplainerPageLayout(ExplainerComponent):
         try:
             self.page.register_callbacks(app)
         except AttributeError:
-            print(f"Warning: {self.page} does not have a register_callbacks method!")
+            logger.warning("%s does not have a register_callbacks method!", self.page)
         if not self.block_selector_callbacks:
             if (
                 hasattr(self.page, "has_pos_label_connector")
                 and self.page.has_pos_label_connector()
             ):
-                print(
-                    "Warning: detected PosLabelConnectors already in the layout. "
+                warnings.warn(
+                    "Detected PosLabelConnectors already in the layout. "
                     "This may clash with the global pos label selector and generate duplicate callback errors. "
-                    "If so set block_selector_callbacks=True."
+                    "If so set block_selector_callbacks=True.",
+                    UserWarning,
                 )
             self.connector.register_callbacks(app)
 
@@ -493,9 +529,8 @@ class ExplainerPageLayout(ExplainerComponent):
         try:
             self.page.calculate_dependencies()
         except AttributeError:
-            print(
-                f"Warning: {self.page} does not have a calculate_dependencies method!",
-                flush=True,
+            logger.warning(
+                "%s does not have a calculate_dependencies method!", self.page
             )
 
 
@@ -525,6 +560,8 @@ class ExplainerDashboard:
         url_base_pathname: str = None,
         routes_pathname_prefix: str = None,
         requests_pathname_prefix: str = None,
+        sagemaker: Optional[bool] = None,
+        dash_kwargs: Optional[Dict] = None,
         responsive: bool = True,
         logins: List[List[str]] = None,
         port: int = 8050,
@@ -610,6 +647,14 @@ class ExplainerDashboard:
                 server is created.
             url_base_pathname (str): url_base_pathname for dashboard,
                 e.g. "/dashboard". Defaults to None.
+            routes_pathname_prefix (str): prefix for routing, e.g. "/".
+            requests_pathname_prefix (str): prefix for requests, e.g.
+                f"/jupyter/default/proxy/{port}/" for SageMaker Studio.
+            sagemaker (bool, optional): set SageMaker Studio proxy defaults for
+                routes_pathname_prefix and requests_pathname_prefix when those are None.
+                If None, try to auto-detect SageMaker.
+            dash_kwargs (dict, optional): extra keyword arguments to pass to
+                dash.Dash/JupyterDash.
             responsive (bool):  make layout responsive to viewport size
                 (i.e. reorganize bootstrap columns on small devices). Set to False
                 when e.g. testing with a headless browser. Defaults to True.
@@ -624,7 +669,7 @@ class ExplainerDashboard:
             shap_interaction(bool, optional): include InteractionsTab if model allows it, defaults to True.
             decision_trees(bool, optional): include DecisionTreesTab if model allows it, defaults to True.
         """
-        print("Building ExplainerDashboard..", flush=True)
+        logger.info("Building ExplainerDashboard...")
 
         self._store_params(no_param=["explainer", "tabs", "server"])
         self._stored_params["tabs"] = self._tabs_to_yaml(tabs)
@@ -649,10 +694,11 @@ class ExplainerDashboard:
             from pkg_resources import parse_version
 
             if parse_version(dash.__version__) > parse_version("2.6.2"):
-                print(
+                warnings.warn(
                     f"WARNING: the number of idxs (={len(self.explainer)}) > max_idxs_in_dropdown(={dynamic_dropdown_threshold}). "
                     f"However with your installed version of dash({dash.__version__}) dropdown search may not work smoothly. "
-                    f"You can downgrade to `pip install dash==2.6.2` which should work better for now..."
+                    f"You can downgrade to `pip install dash==2.6.2` which should work better for now...",
+                    UserWarning,
                 )
 
         if self.description is None:
@@ -668,18 +714,40 @@ class ExplainerDashboard:
             self.is_notebook, self.is_colab = False, False
 
         if self.mode == "dash" and self.is_colab:
-            print(
-                "Detected google colab environment, setting mode='external'", flush=True
+            warnings.warn(
+                "Detected google colab environment, setting mode='external'.",
+                UserWarning,
             )
             self.mode = "external"
         elif self.mode == "dash" and self.is_notebook:
-            print(
+            warnings.warn(
                 "Detected notebook environment, consider setting "
                 "mode='external', mode='inline' or mode='jupyterlab' "
                 "to keep the notebook interactive while the dashboard "
                 "is running...",
-                flush=True,
+                UserWarning,
             )
+
+        if self.sagemaker is None:
+            self.sagemaker = _detect_sagemaker()
+            self._stored_params.pop("sagemaker", None)
+
+        if self.sagemaker:
+            if self.routes_pathname_prefix is None:
+                self.routes_pathname_prefix = "/"
+                self._stored_params["routes_pathname_prefix"] = (
+                    self.routes_pathname_prefix
+                )
+            if self.requests_pathname_prefix is None:
+                _, default_requests = _sagemaker_default_prefixes(self.port)
+                self.requests_pathname_prefix = default_requests
+                self._stored_params["requests_pathname_prefix"] = (
+                    self.requests_pathname_prefix
+                )
+
+        if self.dash_kwargs is None:
+            self.dash_kwargs = {}
+            self._stored_params["dash_kwargs"] = self.dash_kwargs
 
         if self.bootstrap is not None:
             bootstrap_theme = (
@@ -737,24 +805,24 @@ class ExplainerDashboard:
             else:
                 tabs = []
                 if model_summary and explainer.y_missing:
-                    print(
-                        "No y labels were passed to the Explainer, so setting"
-                        " model_summary=False...",
-                        flush=True,
+                    warnings.warn(
+                        "No y labels were passed to the Explainer, so setting "
+                        "model_summary=False...",
+                        UserWarning,
                     )
                     model_summary = False
                 if shap_interaction and (not explainer.interactions_should_work):
-                    print(
+                    warnings.warn(
                         "For this type of model and model_output interactions don't "
                         "work, so setting shap_interaction=False...",
-                        flush=True,
+                        UserWarning,
                     )
                     shap_interaction = False
                 if decision_trees and not hasattr(explainer, "is_tree_explainer"):
-                    print(
-                        "The explainer object has no decision_trees property. so "
+                    warnings.warn(
+                        "The explainer object has no decision_trees property, so "
                         "setting decision_trees=False...",
-                        flush=True,
+                        UserWarning,
                     )
                     decision_trees = False
 
@@ -773,10 +841,10 @@ class ExplainerDashboard:
                 if shap_dependence:
                     tabs.append(ShapDependenceComposite)
                 if shap_interaction:
-                    print(
-                        "Warning: calculating shap interaction values can be slow! "
+                    warnings.warn(
+                        "Calculating shap interaction values can be slow. "
                         "Pass shap_interaction=False to remove interactions tab.",
-                        flush=True,
+                        UserWarning,
                     )
                     tabs.append(ShapInteractionsComposite)
                 if decision_trees:
@@ -790,7 +858,7 @@ class ExplainerDashboard:
             self.header_hide_selector = True
             self.header_hide_download = True
 
-        print("Generating layout...")
+        logger.info("Generating layout...")
         _, i = yield_id(return_i=True)  # store id generator index
         reset_id_generator("db")  # reset id generator to 0 with prefix "db"
         if hasattr(self.explainer, "_index_list"):
@@ -838,15 +906,14 @@ class ExplainerDashboard:
         self.app.layout = self.explainer_layout.layout()
         reset_id_generator(start=i + 1)  # reset id generator to previous index
 
-        print("Calculating dependencies...", flush=True)
+        logger.info("Calculating dependencies...")
         self.explainer_layout.calculate_dependencies()
-        print(
+        logger.info(
             "Reminder: you can store the explainer (including calculated "
             "dependencies) with explainer.dump('explainer.joblib') and "
-            "reload with e.g. ClassifierExplainer.from_file('explainer.joblib')",
-            flush=True,
+            "reload with e.g. ClassifierExplainer.from_file('explainer.joblib')"
         )
-        print("Registering callbacks...", flush=True)
+        logger.info("Registering callbacks...")
         self.explainer_layout.register_callbacks(self.app)
 
     def to_html(self):
@@ -898,12 +965,12 @@ class ExplainerDashboard:
                 config = yaml.safe_load(open(str(arg1), "r"))
             elif isinstance(arg1, dict):
                 config = arg1
-                assert "dashboard" in config, (
-                    ".yaml file does not have `dashboard` param."
-                )
-                assert "explainerfile" in config["dashboard"], (
-                    ".yaml file does not have explainerfile param"
-                )
+                assert (
+                    "dashboard" in config
+                ), ".yaml file does not have `dashboard` param."
+                assert (
+                    "explainerfile" in config["dashboard"]
+                ), ".yaml file does not have explainerfile param"
 
             explainer = BaseExplainer.from_file(config["dashboard"]["explainerfile"])
         else:
@@ -1002,16 +1069,14 @@ class ExplainerDashboard:
             else:
                 explainerfile_absolute_path = dashboard_path / explainerfile
 
-            print(
-                f"Dumping configuration .yaml to {Path(filepath).absolute()}...",
-                flush=True,
+            logger.info(
+                "Dumping configuration .yaml to %s...",
+                Path(filepath).absolute(),
             )
             yaml.dump(dashboard_config, open(filepath, "w"))
 
             if dump_explainer:
-                print(
-                    f"Dumping explainer to {explainerfile_absolute_path}...", flush=True
-                )
+                logger.info("Dumping explainer to %s...", explainerfile_absolute_path)
                 self.explainer.dump(explainerfile_absolute_path)
             return
         return yaml.dump(dashboard_config)
@@ -1139,7 +1204,7 @@ class ExplainerDashboard:
             if isinstance(tab, str):
                 return tab
             elif isinstance(tab, dict):
-                print(tab)
+                logger.debug("Loading tab from yaml config: %s", tab)
                 if "component_imports" in tab and tab["component_imports"] is not None:
                     for class_name, module_name in tab["component_imports"].items():
                         if class_name not in globals():
@@ -1166,7 +1231,7 @@ class ExplainerDashboard:
             instantiate_tab(tab, explainer, name=str(i + 1))
             for i, tab in enumerate(yamltabs)
         ]
-        print(tabs)
+        logger.debug("Instantiated tabs from yaml: %s", tabs)
         return tabs
 
     def _get_dash_app(self):
@@ -1194,6 +1259,7 @@ class ExplainerDashboard:
                 routes_pathname_prefix=self.routes_pathname_prefix,
                 requests_pathname_prefix=self.requests_pathname_prefix,
                 meta_tags=meta_tags,
+                **self.dash_kwargs,
             )
         elif self.mode in ["inline", "jupyterlab", "external"]:
             app = JupyterDash(
@@ -1201,6 +1267,7 @@ class ExplainerDashboard:
                 external_stylesheets=self.external_stylesheets,
                 assets_ignore=assets_ignore,
                 meta_tags=meta_tags,
+                **self.dash_kwargs,
             )
         else:
             raise ValueError(
@@ -1215,10 +1282,21 @@ class ExplainerDashboard:
     def flask_server(self):
         """returns self.app.server so that it can be exposed to e.g. gunicorn"""
         if self.mode != "dash":
-            print("Warning: in production you should probably use mode='dash'...")
+            warnings.warn(
+                "In production you should probably use mode='dash'.",
+                UserWarning,
+            )
         return self.app.server
 
-    def run(self, port=None, host="0.0.0.0", use_waitress=False, mode=None, **kwargs):
+    def run(
+        self,
+        port: int = None,
+        host: str = "0.0.0.0",
+        use_waitress: bool = False,
+        mode: str = None,
+        sagemaker: Optional[bool] = None,
+        **kwargs,
+    ):
         """Start ExplainerDashboard on port
 
         Args:
@@ -1234,6 +1312,9 @@ class ExplainerDashboard:
                 Overrides self.mode, in which case the dashboard will get
                 rebuilt before running it with the right type of dash server.
                 (dash.Dash or JupyterDash). Defaults to None (i.e. self.mode)
+            sagemaker (bool, optional): if True, apply SageMaker Studio proxy defaults
+                for routes_pathname_prefix and requests_pathname_prefix. If None,
+                use the value from the dashboard initialization.
             Defaults to None.self.port defaults to 8050.
 
         Raises:
@@ -1246,44 +1327,85 @@ class ExplainerDashboard:
             port = self.port
         if mode is None:
             mode = self.mode
+        if sagemaker is None:
+            sagemaker = getattr(self, "sagemaker", False)
+        if sagemaker and mode != "dash":
+            warnings.warn(
+                "sagemaker=True requires mode='dash'. Forcing mode='dash' before launch.",
+                UserWarning,
+            )
+            mode = "dash"
+        if sagemaker:
+            routes_pathname_prefix, requests_pathname_prefix = (
+                self.routes_pathname_prefix,
+                self.requests_pathname_prefix,
+            )
+            default_routes, default_requests = _sagemaker_default_prefixes(port)
+            if routes_pathname_prefix is None:
+                routes_pathname_prefix = default_routes
+            if requests_pathname_prefix is None:
+                requests_pathname_prefix = default_requests
 
         if use_waitress and mode != "dash":
-            print(
-                f"Warning: waitress does not work with mode={self.mode}, "
-                "using JupyterDash server instead!",
-                flush=True,
+            warnings.warn(
+                f"Waitress does not work with mode={self.mode}, using JupyterDash server instead!",
+                UserWarning,
             )
         if mode == "dash":
-            if self.mode != "dash":
-                print(
-                    "Warning: Original ExplainerDashboard was not initialized "
-                    "with mode='dash'. Rebuilding dashboard before launch:",
-                    flush=True,
+            needs_rebuild = self.mode != "dash"
+            if sagemaker:
+                needs_rebuild = needs_rebuild or (
+                    self.routes_pathname_prefix != routes_pathname_prefix
+                    or self.requests_pathname_prefix != requests_pathname_prefix
                 )
+            if needs_rebuild:
+                if self.mode != "dash":
+                    warnings.warn(
+                        "Original ExplainerDashboard was not initialized with mode='dash'. "
+                        "Rebuilding dashboard before launch.",
+                        UserWarning,
+                    )
+                elif sagemaker:
+                    logger.info(
+                        "Applying SageMaker proxy settings. Rebuilding dashboard before launch."
+                    )
+                update_params = {"mode": "dash", "port": port}
+                if sagemaker:
+                    update_params.update(
+                        dict(
+                            sagemaker=True,
+                            routes_pathname_prefix=routes_pathname_prefix,
+                            requests_pathname_prefix=requests_pathname_prefix,
+                        )
+                    )
                 app = ExplainerDashboard.from_config(
-                    self.explainer, self.to_yaml(return_dict=True), mode="dash"
+                    self.explainer, self.to_yaml(return_dict=True), **update_params
                 ).app
             else:
                 app = self.app
 
-            print(
-                f"Starting ExplainerDashboard on http://{get_local_ip_adress()}:{port}",
-                flush=True,
+            logger.info(
+                "Starting ExplainerDashboard on http://%s:%s",
+                get_local_ip_adress(),
+                port,
             )
             if use_waitress:
                 from waitress import serve
+
                 serve(app.server, host=host, port=port)
             else:
                 try:
+                    # Dash 3.0+ uses run()
                     app.run(port=port, host=host, **kwargs)
                 except AttributeError:
+                    # Fallback for Dash 2.x
                     app.run_server(port=port, host=host, **kwargs)
         else:
             if self.mode == "dash":
-                print(
-                    "Warning: Original ExplainerDashboard was initialized "
-                    "with mode='dash'. Rebuilding dashboard before launch:",
-                    flush=True,
+                warnings.warn(
+                    "Original ExplainerDashboard was initialized with mode='dash'. "
+                    "Rebuilding dashboard before launch.",
+                    UserWarning,
                 )
                 app = ExplainerDashboard.from_config(
                     self.explainer, self.to_yaml(return_dict=True), mode=mode
@@ -1292,22 +1414,42 @@ class ExplainerDashboard:
                 app = self.app
             if mode == "external":
                 if not self.is_colab or self.mode == "external":
-                    print(
-                        f"Starting ExplainerDashboard on http://{get_local_ip_adress()}:{port}\n"
-                        "You can terminate the dashboard with "
-                        f"ExplainerDashboard.terminate({port})",
-                        flush=True,
+                    logger.info(
+                        "Starting ExplainerDashboard on http://%s:%s\n"
+                        "You can terminate the dashboard with ExplainerDashboard.terminate(%s)",
+                        get_local_ip_adress(),
+                        port,
+                        port,
                     )
-                app.run_server(port=port, mode=mode, **kwargs)
+                try:
+                    # Dash 3.0+ uses run() with jupyter_mode parameter
+                    app.run(port=port, jupyter_mode=mode, **kwargs)
+                except (TypeError, AttributeError):
+                    # Fallback for Dash 2.x / older JupyterDash versions
+                    app.run_server(port=port, mode=mode, **kwargs)
             elif mode in ["inline", "jupyterlab"]:
-                print(
-                    f"Starting ExplainerDashboard inline (terminate it with "
-                    f"ExplainerDashboard.terminate({port}))",
-                    flush=True,
+                logger.info(
+                    "Starting ExplainerDashboard inline (terminate it with ExplainerDashboard.terminate(%s))",
+                    port,
                 )
-                app.run_server(
-                    port=port, mode=mode, width=self.width, height=self.height, **kwargs
-                )
+                try:
+                    # Dash 3.0+ uses run() with jupyter_mode, jupyter_width, jupyter_height parameters
+                    app.run(
+                        port=port,
+                        jupyter_mode=mode,
+                        jupyter_width=self.width,
+                        jupyter_height=self.height,
+                        **kwargs,
+                    )
+                except (TypeError, AttributeError):
+                    # Fallback for Dash 2.x / older JupyterDash versions
+                    app.run_server(
+                        port=port,
+                        mode=mode,
+                        width=self.width,
+                        height=self.height,
+                        **kwargs,
+                    )
             else:
                 raise ValueError(f"Unknown mode: mode='{mode}'!")
 
@@ -1335,11 +1477,11 @@ class ExplainerDashboard:
             token = JupyterDash._token
 
         shutdown_url = f"http://localhost:{port}/_shutdown_{token}"
-        print(f"Trying to shut down dashboard on port {port}...")
+        logger.info("Trying to shut down dashboard on port %s...", port)
         try:
             _ = requests.get(shutdown_url)
         except Exception as e:
-            print(f"Something seems to have failed: {e}")
+            logger.warning("Something seems to have failed: %s", e)
 
 
 class ExplainerHub:
@@ -1475,8 +1617,9 @@ class ExplainerHub:
         self._store_params(no_store=["dashboards", "logins", "secret_key"])
 
         if user_json is not None:
-            print(
-                "Warning: user_json has been deprecated, use users_file parameter instead!"
+            warnings.warn(
+                "user_json has been deprecated, use users_file parameter instead!",
+                DeprecationWarning,
             )
             self.users_file = user_json
         if self.description is None:
@@ -1507,9 +1650,9 @@ class ExplainerHub:
             self.app.config["SECRET_KEY"] = secret_key
         SimpleLogin(self.app, login_checker=self._validate_user)
 
-        assert self.max_dashboards is None or len(dashboards) <= self.max_dashboards, (
-            f"There should be less than {self.max_dashboards} in the hub."
-        )
+        assert (
+            self.max_dashboards is None or len(dashboards) <= self.max_dashboards
+        ), f"There should be less than {self.max_dashboards} in the hub."
 
         self.dashboards = self._instantiate_dashboards(dashboards, **kwargs)
         self.added_dashboard_counter = len(self.dashboards)
@@ -1518,19 +1661,18 @@ class ExplainerHub:
         self.removed_dashboard_names = []
 
         if self.add_dashboard_route:
-            print(
-                "WARNING: if you add_dashboard_route new dashboards will be"
-                "added to a specific hub instance/worker/node. So this will"
-                "only work if you run the hub as a single worker on a single node!"
+            warnings.warn(
+                "If you add_dashboard_route, new dashboards will be added to a specific hub "
+                "instance/worker/node. This only works if you run the hub as a single worker "
+                "on a single node!",
+                UserWarning,
             )
 
-        assert len(set(self.dashboard_names)) == len(self.dashboard_names), (
-            f"All dashboard .name properties should be unique, but received the following: {self.dashboard_names}"
-        )
+        assert (
+            len(set(self.dashboard_names)) == len(self.dashboard_names)
+        ), f"All dashboard .name properties should be unique, but received the following: {self.dashboard_names}"
         illegal_names = list(set(self.dashboard_names) & self.__reserved_names)
-        assert not illegal_names, (
-            f"The following .name properties for dashboards are not allowed: {illegal_names}!"
-        )
+        assert not illegal_names, f"The following .name properties for dashboards are not allowed: {illegal_names}!"
 
         if self.users:
             for dashboard in self.dashboards:
@@ -1574,6 +1716,18 @@ class ExplainerHub:
             if self.users and not self.dbs_open_by_default:
                 self._protect_dashviews(self.index_page)
 
+    @contextmanager
+    def _allow_dynamic_setup_after_first_request(self):
+        """Temporarily bypass Flask setup lock for dynamic add_dashboard_route updates."""
+        original = getattr(self.app, "_got_first_request", None)
+        if original:
+            self.app._got_first_request = False
+        try:
+            yield
+        finally:
+            if original is not None:
+                self.app._got_first_request = original
+
     def add_dashboard(self, dashboard: ExplainerDashboard, **kwargs):
         """Add a dashboard to the hub
 
@@ -1586,10 +1740,10 @@ class ExplainerHub:
             self.max_dashboards is not None
             and len(self.dashboards) >= self.max_dashboards
         ):
-            print(
-                f"Warning: exceeded max_dashboards={self.max_dashboards}, so deleting "
+            warnings.warn(
+                f"Exceeded max_dashboards={self.max_dashboards}, so deleting "
                 f"the first {self.base_route}/{self.dashboard_names[0]}!",
-                flush=True,
+                UserWarning,
             )
             self.remove_dashboard(self.dashboard_names[0])
 
@@ -1627,19 +1781,23 @@ class ExplainerHub:
                 if user not in self.logins:
                     self.add_user(user, password)
                 else:
-                    print(
-                        f"Warning: {user} in {dashboard.name} already in "
-                        "ExplainerHub logins! So not adding to logins..."
+                    warnings.warn(
+                        f"{user} in {dashboard.name} already in "
+                        "ExplainerHub logins! So not adding to logins...",
+                        UserWarning,
                     )
                 self.add_user_to_dashboard(dashboard.name, user)
         config = deepcopy(dashboard.to_yaml(return_dict=True))
         config["dashboard"]["params"]["logins"] = None
 
-        self.dashboards.append(
-            ExplainerDashboard.from_config(
-                dashboard.explainer, config, **update_kwargs(kwargs, **update_params)
+        with self._allow_dynamic_setup_after_first_request():
+            self.dashboards.append(
+                ExplainerDashboard.from_config(
+                    dashboard.explainer,
+                    config,
+                    **update_kwargs(kwargs, **update_params),
+                )
             )
-        )
 
         self.dashboard_names.append(dashboard.name)
 
@@ -1662,14 +1820,15 @@ class ExplainerHub:
                 inner.__name__ = "return_dashboard_" + dashboard.name
                 return inner
 
-        if self.users:
-            self.app.route(f"/{self.base_route}/_{dashboard.name}")(
-                login_required(dashboard_route(dashboard))
-            )
-        else:
-            self.app.route(f"/{self.base_route}/_{dashboard.name}")(
-                dashboard_route(dashboard)
-            )
+        with self._allow_dynamic_setup_after_first_request():
+            if self.users:
+                self.app.route(f"/{self.base_route}/_{dashboard.name}")(
+                    login_required(dashboard_route(dashboard))
+                )
+            else:
+                self.app.route(f"/{self.base_route}/_{dashboard.name}")(
+                    dashboard_route(dashboard)
+                )
         return dashboard.name
 
     @classmethod
@@ -1690,9 +1849,9 @@ class ExplainerHub:
         elif isinstance(config, dict):
             config = deepcopy(config)
 
-        assert "explainerhub" in config, (
-            "Malformed yaml: explainerhub yaml file should start with 'explainerhub:'!"
-        )
+        assert (
+            "explainerhub" in config
+        ), "Malformed yaml: explainerhub yaml file should start with 'explainerhub:'!"
 
         config = config["explainerhub"]
 
@@ -1756,16 +1915,23 @@ class ExplainerHub:
                     dashboards=[
                         dashboard.to_yaml(
                             return_dict=True,
-                            explainerfile=dashboard.name + "_explainer.joblib",
-                            dump_explainer=dump_explainers,
+                            explainerfile=dashboard.name + f"_explainer.{pickle_type}",
+                            dump_explainer=False,
                         )
                         for dashboard in self.dashboards
                     ],
                 )
             )
+            if filepath is not None and dump_explainers:
+                for dashboard in self.dashboards:
+                    explainer_path = filepath.parent / (
+                        dashboard.name + f"_explainer.{pickle_type}"
+                    )
+                    logger.info("Dumping explainer to %s...", explainer_path)
+                    dashboard.explainer.dump(explainer_path)
         else:
             for dashboard in self.dashboards:
-                print(f"Storing {dashboard.name}_dashboard.yaml...")
+                logger.info("Storing %s_dashboard.yaml...", dashboard.name)
                 dashboard.to_yaml(
                     filepath.parent / (dashboard.name + "_dashboard.yaml"),
                     explainerfile=filepath.parent
@@ -1789,7 +1955,7 @@ class ExplainerHub:
             return yaml.dump(hub_config)
 
         filepath = Path(filepath)
-        print(f"Storing {filepath}...")
+        logger.info("Storing %s...", filepath)
         yaml.dump(hub_config, open(filepath, "w"))
         return
 
@@ -1853,11 +2019,10 @@ class ExplainerHub:
         dashboard_list = []
         for i, dashboard in enumerate(dashboards):
             if dashboard.name is None:
-                print(
-                    "Reminder, you can set ExplainerDashboard .name and .description "
-                    "in order to control the url path of the dashboard. Now "
-                    f"defaulting to name=dashboard{i + 1} and default description...",
-                    flush=True,
+                logger.info(
+                    "You can set ExplainerDashboard .name and .description to control the url path. "
+                    "Defaulting to name=dashboard%s and default description...",
+                    i + 1,
                 )
                 dashboard_name = f"dashboard{i + 1}"
             else:
@@ -1877,9 +2042,10 @@ class ExplainerHub:
                     if user not in self.logins:
                         self.add_user(user, password)
                     else:
-                        print(
-                            f"Warning: {user} in {dashboard.name} already in "
-                            "ExplainerHub logins! So not adding to logins..."
+                        warnings.warn(
+                            f"{user} in {dashboard.name} already in "
+                            "ExplainerHub logins! So not adding to logins...",
+                            UserWarning,
                         )
                     self.add_user_to_dashboard(dashboard_name, user)
             config = deepcopy(dashboard.to_yaml(return_dict=True))
@@ -1915,9 +2081,9 @@ class ExplainerHub:
                 raise ValueError("users_file should end with either .json or .yaml!")
 
             assert "users" in users_db, f"{users_file} should contain a 'users' dict!"
-            assert "dashboard_users" in users_db, (
-                f"{users_file} should contain a 'dashboard_users' dict!"
-            )
+            assert (
+                "dashboard_users" in users_db
+            ), f"{users_file} should contain a 'dashboard_users' dict!"
 
     def _hash_logins(self, logins: List[List], add_to_users_file: bool = False):
         """Turn a list of [user, password] pairs into a Flask-Login style user
@@ -2051,7 +2217,7 @@ class ExplainerHub:
         try:
             del users_db["users"][username]
         except Exception as e:
-            print(f"ERROR: Failed to delete user from users.json! Error: {e}", flush=True)
+            logger.error("Failed to delete user from users.json! Error: %s", e)
         for dashboard in users_db["dashboard_users"].keys():
             dashboard_users = users_db["dashboard_users"].get(dashboard)
             if dashboard_users is not None:
@@ -2412,11 +2578,11 @@ class ExplainerHub:
         if filename is None:
             return html
         with open(filename, "w") as f:
-            print(f"Saving hub to {filename}...")
+            logger.info("Saving hub to %s...", filename)
             f.write(html)
         if save_dashboards:
             for db in self.dashboards:
-                print(f"Saving dashboard {db.name} to {db.name}.html...")
+                logger.info("Saving dashboard %s to %s.html...", db.name, db.name)
                 db.save_html(db.name + ".html")
 
     def to_zip(self, filename: Union[str, Path], name: str = "explainerhub"):
@@ -2434,7 +2600,7 @@ class ExplainerHub:
         for db in self.dashboards:
             zf.writestr(f"/{name}/" + db.name + ".html", db.to_html())
         zf.close()
-        print(f"Saved static html version of ExplainerHub to {filename}...")
+        logger.info("Saved static html version of ExplainerHub to %s...", filename)
 
     def _hub_page(self, route, static=False):
         """Returns a html bootstrap wrapper around a particular flask route (hosting an ExplainerDashboard)
@@ -2496,9 +2662,9 @@ class ExplainerHub:
             page += f"\n<div>\n{route}\n</div>\n"
         else:
             page += f"""
-            
+
             <div class="mt-4 embed-responsive" style="min-height: {self.min_height}px">
-                 <iframe 
+                 <iframe
                          src="{route}"
                          style="overflow-x: hidden; overflow-y: visible; position: absolute; width: 95%; height: 100%; background: transparent"
                 ></iframe>
@@ -2585,7 +2751,7 @@ class ExplainerHub:
                             )
                             return redirect(f"/dashboards/_{dashboard_name}", code=302)
                     except Exception as e:
-                        print(f"ERROR: Failed to add dashboard! Error: {e}", flush=True)
+                        logger.error("Failed to add dashboard! Error: %s", e)
                     return redirect("/", code=302)
 
                 remove_dashboard_match = remove_dashboard_pattern.match(request.path)
@@ -2595,7 +2761,7 @@ class ExplainerHub:
                         if dashboard_name in self.dashboard_names:
                             self.remove_dashboard(dashboard_name)
                     except Exception as e:
-                        print(f"ERROR: Failed to remove dashboard! Error: {e}", flush=True)
+                        logger.error("Failed to remove dashboard! Error: %s", e)
                     return redirect("/", code=302)
 
     def flask_server(self):
@@ -2614,9 +2780,8 @@ class ExplainerHub:
         """
         if port is None:
             port = self.port
-        print(
-            f"Starting ExplainerHub on http://{host}:{port}{self.index_route}",
-            flush=True,
+        logger.info(
+            "Starting ExplainerHub on http://%s:%s%s", host, port, self.index_route
         )
         if use_waitress:
             import waitress
@@ -2691,11 +2856,11 @@ class InlineExplainer:
             token = JupyterDash._token
 
         shutdown_url = f"http://localhost:{port}/_shutdown_{token}"
-        print(f"Trying to shut down dashboard on port {port}...")
+        logger.info("Trying to shut down dashboard on port %s...", port)
         try:
             _ = requests.get(shutdown_url)
         except Exception as e:
-            print(f"Something seems to have failed: {e}")
+            logger.warning("Something seems to have failed: %s", e)
 
     def _run_app(self, app, **kwargs):
         """Starts the dashboard either inline or in a separate tab
@@ -2705,11 +2870,29 @@ class InlineExplainer:
         """
         pio.templates.default = "none"
         if self._mode in ["inline", "jupyterlab"]:
-            app.run_server(
-                mode=self._mode, width=self._width, height=self._height, port=self._port
-            )
+            try:
+                # Dash 3.0+ uses run() with jupyter_mode, jupyter_width, jupyter_height parameters
+                app.run(
+                    jupyter_mode=self._mode,
+                    jupyter_width=self._width,
+                    jupyter_height=self._height,
+                    port=self._port,
+                )
+            except (TypeError, AttributeError):
+                # Fallback for Dash 2.x / older JupyterDash versions
+                app.run_server(
+                    mode=self._mode,
+                    width=self._width,
+                    height=self._height,
+                    port=self._port,
+                )
         elif self._mode == "external":
-            app.run_server(mode=self._mode, port=self._port, **self._kwargs)
+            try:
+                # Dash 3.0+ uses run() with jupyter_mode parameter
+                app.run(jupyter_mode=self._mode, port=self._port, **self._kwargs)
+            except (TypeError, AttributeError):
+                # Fallback for Dash 2.x / older JupyterDash versions
+                app.run_server(mode=self._mode, port=self._port, **self._kwargs)
         else:
             raise ValueError(
                 "mode should either be 'inline', 'jupyterlab'  or 'external'!"

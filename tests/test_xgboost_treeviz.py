@@ -1,4 +1,3 @@
-
 import pandas as pd
 
 import plotly.graph_objects as go
@@ -26,6 +25,14 @@ def test_xgbclas_decisionpath_df(precalculated_xgb_classifier_explainer, test_na
         tree_idx=0, index=test_names[0]
     )
     assert isinstance(df, pd.DataFrame)
+
+
+def test_xgbclas_decisiontree_view_contract(precalculated_xgb_classifier_explainer):
+    precalculated_xgb_classifier_explainer._graphviz_available = True
+    render = precalculated_xgb_classifier_explainer.decisiontree_view(
+        tree_idx=0, index=0
+    )
+    assert isinstance(render, dtreeviz.utils.DTreeVizRender)
 
 
 def test_xgbclas_plot_trees(precalculated_xgb_classifier_explainer, test_names):
@@ -119,3 +126,20 @@ def test_plot_trees(precalculated_xgb_multiclass_explainer, test_names):
 
 def test_calculate_properties(precalculated_xgb_multiclass_explainer):
     precalculated_xgb_multiclass_explainer.calculate_properties()
+
+
+def test_decisionpath_summary_uses_logodds_label_for_multiclass_logodds(
+    precalculated_xgb_multiclass_explainer,
+):
+    assert precalculated_xgb_multiclass_explainer.model_output == "logodds"
+
+    summary_df = precalculated_xgb_multiclass_explainer.get_decisionpath_summary_df(
+        tree_idx=0, index=0, pos_label=0
+    )
+    prediction_rows = summary_df[
+        summary_df["split_condition"].str.contains("prediction", regex=False)
+    ]
+    assert not prediction_rows.empty
+    assert prediction_rows.iloc[-1]["split_condition"].startswith(
+        "prediction (logodds) = "
+    )

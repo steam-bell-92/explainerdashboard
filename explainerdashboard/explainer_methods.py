@@ -2,12 +2,20 @@ __all__ = [
     "IndexNotFoundError",
     "append_dict_to_df",
     "safe_isinstance",
+    "unwrap_calibrated_classifier",
+    "align_categorical_dtypes",
+    "sanitize_categorical_predict_input",
+    "sorted_categorical_values",
     "guess_shap",
     "mape_score",
     "parse_cats",
+    "is_binary_like_onehot_column",
+    "infer_cats_from_transformed_X",
     "get_encoded_and_regular_cols",
     "split_pipeline",
+    "rename_pipeline_columns",
     "get_transformed_X",
+    "build_pipeline_extraction_warning",
     "retrieve_onehot_value",
     "merge_categorical_columns",
     "matching_cols",
@@ -32,17 +40,23 @@ __all__ = [
     "get_xgboost_path_df",
     "get_xgboost_path_summary_df",
     "get_xgboost_preds_df",
+    "get_lgbm_preds_df",
+    "get_multiclass_logodds_scores",
+    "get_xgboost_output_label",
+    "_ensure_numeric_predictions",  # Internal helper for XGBoost 3.0+ compatibility
+    "_safe_make_scorer",  # Internal helper for CatBoost compatibility
 ]
 
 from functools import partial
 import re
 from collections import Counter
-from typing import List, Union
+from typing import Callable, List, Optional, Union
 import warnings
+import logging
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 
 from sklearn.metrics import make_scorer
@@ -51,6 +65,362 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from joblib import Parallel, delayed
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_numeric_predictions(pred):
+    """Convert predictions to numeric format, handling XGBoost 3.0+ string format.
+
+    Args:
+        pred: Prediction output from model (may be string, array, scalar, list)
+
+    Returns:
+        Numeric prediction (numpy array or scalar float)
+    """
+    # Handle None
+    if pred is None:
+        return None
+
+    # Handle string predictions (XGBoost 3.0+ may return strings like '[3.2967056E1]' or '[8.563135E-2,7.169811E-1,1.9738752E-1]')
+    if isinstance(pred, str):
+        try:
+            # Remove brackets and whitespace
+            cleaned = pred.strip().strip("[]").strip()
+            # Check if it contains comma-separated values
+            if "," in cleaned:
+                # Multiple values - convert to array
+                values = [float(v.strip()) for v in cleaned.split(",")]
+                return np.asarray(values)
+            else:
+                # Single value
+                return float(cleaned)
+        except (ValueError, AttributeError, TypeError):
+            # If conversion fails, try regex extraction
+            import re
+
+            # Use non-capturing group to get full numeric matches, not just exponent part
+            pattern = r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?"
+            matches = re.findall(pattern, pred)
+            if matches:
+                if len(matches) == 1:
+                    return float(matches[0])
+                else:
+                    return np.asarray([float(m) for m in matches])
+            # If all else fails, return as-is (will raise error later)
+            return pred
+
+    # Handle list/tuple of strings or mixed types
+    if isinstance(pred, (list, tuple)):
+        try:
+            converted = []
+            for item in pred:
+                if isinstance(item, str):
+                    cleaned = item.strip().strip("[]").strip()
+                    converted.append(float(cleaned))
+                else:
+                    item_conv = _ensure_numeric_predictions(item)
+                    converted.append(
+                        float(item_conv)
+                        if not isinstance(item_conv, np.ndarray)
+                        else item_conv
+                    )
+            return np.asarray(converted)
+        except (ValueError, AttributeError, TypeError):
+            pass  # Fall through to array conversion
+
+    # Convert to numpy array for processing
+    try:
+        pred_array = np.asarray(pred)
+    except (ValueError, TypeError):
+        # If we can't convert to array, try direct conversion
+        if isinstance(pred, (int, float)):
+            return float(pred)
+        return pred
+
+    # Handle string arrays (XGBoost 3.0+ may return arrays of strings)
+    if pred_array.dtype.kind == "U":  # Unicode string array
+        try:
+            # Convert each string element to float
+            def _convert_elem(elem):
+                if isinstance(elem, str):
+                    cleaned = elem.strip().strip("[]").strip()
+                    # Handle comma-separated values in string
+                    if "," in cleaned:
+                        # Multiple values - should not happen in scalar context, but handle it
+                        values = [float(v.strip()) for v in cleaned.split(",")]
+                        return values[0] if len(values) == 1 else np.asarray(values)
+                    # Handle scientific notation
+                    try:
+                        return float(cleaned)
+                    except ValueError:
+                        # Try regex extraction as fallback
+                        import re
+
+                        match = re.search(
+                            r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?", cleaned
+                        )
+                        if match:
+                            return float(match.group())
+                        raise
+                elif isinstance(elem, (int, float, np.integer, np.floating)):
+                    return float(elem)
+                elif isinstance(elem, np.ndarray):
+                    return float(elem.item()) if elem.ndim == 0 else elem
+                return elem
+
+            if pred_array.ndim == 0:
+                # Scalar string array
+                return _convert_elem(pred_array.item())
+            else:
+                # Multi-dimensional string array
+                converted = []
+                for p in pred_array.flatten():
+                    try:
+                        converted.append(_convert_elem(p))
+                    except (ValueError, TypeError):
+                        # Try regex extraction as fallback
+                        import re
+
+                        p_str = str(p)
+                        match = re.search(
+                            r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?", p_str
+                        )
+                        if match:
+                            converted.append(float(match.group()))
+                        else:
+                            raise
+                return np.array(converted).reshape(pred_array.shape)
+        except (ValueError, AttributeError, TypeError):
+            # If conversion fails, return original (will raise error later)
+            return pred
+
+    # Already numeric, return as numpy array or scalar
+    if pred_array.ndim == 0:
+        return pred_array.item()
+    return pred_array
+
+
+def _decision_scores_to_probas(decision_scores, n_labels=None):
+    """Map decision_function outputs to probability-like class scores."""
+    scores = np.asarray(decision_scores)
+    if scores.ndim == 0:
+        scores = scores.reshape(1)
+    if scores.ndim == 1 and n_labels and n_labels > 2 and scores.shape[0] == n_labels:
+        scores = scores.reshape(1, -1)
+
+    if scores.ndim == 1:
+        clipped = np.clip(scores.astype("float64"), -709, 709)
+        pos_probs = 1.0 / (1.0 + np.exp(-clipped))
+        return np.column_stack([1.0 - pos_probs, pos_probs])
+
+    if scores.ndim == 2:
+        if scores.shape[1] == 1:
+            clipped = np.clip(scores[:, 0].astype("float64"), -709, 709)
+            pos_probs = 1.0 / (1.0 + np.exp(-clipped))
+            return np.column_stack([1.0 - pos_probs, pos_probs])
+
+        shifted = scores - np.max(scores, axis=1, keepdims=True)
+        exp_scores = np.exp(shifted)
+        denom = np.sum(exp_scores, axis=1, keepdims=True)
+        return exp_scores / np.clip(denom, np.finfo("float64").tiny, None)
+
+    raise ValueError(
+        f"Unexpected decision_function output shape {scores.shape}. "
+        "Expected 1D or 2D scores."
+    )
+
+
+def _predict_proba_with_fallback(model, model_input, n_labels=None):
+    """Return per-class probabilities, with decision_function fallback."""
+    pred_probas = None
+    predict_error = None
+
+    if hasattr(model, "predict_proba"):
+        try:
+            pred_raw = model.predict_proba(model_input)
+            pred_raw = _ensure_numeric_predictions(pred_raw)
+            pred_probas = np.asarray(pred_raw, dtype="float64")
+        except Exception as e:
+            predict_error = e
+
+    if pred_probas is not None:
+        if pred_probas.ndim == 1:
+            if n_labels == 2:
+                pred_probas = np.column_stack([1.0 - pred_probas, pred_probas])
+            else:
+                pred_probas = None
+        elif pred_probas.ndim != 2:
+            pred_probas = None
+
+        if (
+            pred_probas is not None
+            and n_labels is not None
+            and pred_probas.shape[1] != n_labels
+        ):
+            pred_probas = None
+
+    if pred_probas is None and hasattr(model, "decision_function"):
+        decision_scores_raw = model.decision_function(model_input)
+        decision_scores_raw = _ensure_numeric_predictions(decision_scores_raw)
+        pred_probas = _decision_scores_to_probas(decision_scores_raw, n_labels=n_labels)
+
+    if pred_probas is None:
+        if predict_error is not None:
+            raise ValueError(
+                "Could not compute class probabilities from model.predict_proba(...)."
+            ) from predict_error
+        raise ValueError(
+            "Could not compute class probabilities: model has neither a working "
+            "predict_proba(...) nor decision_function(...)."
+        )
+
+    if n_labels is not None and pred_probas.shape[1] != n_labels:
+        raise ValueError(
+            f"Expected {n_labels} class probabilities, got shape {pred_probas.shape}."
+        )
+    return pred_probas
+
+
+def get_multiclass_logodds_scores(model, model_input, n_labels):
+    """Return per-class raw scores used as multiclass logodds/margins.
+
+    Tries common model APIs in order and returns None when unavailable.
+
+    Args:
+        model: Fitted classifier model.
+        model_input: Single-row model input (already sanitized for model type).
+        n_labels (int): Expected number of classes.
+
+    Returns:
+        np.ndarray or None: 1d array of raw scores of length n_labels.
+    """
+    raw_scores = None
+
+    for kwargs in (
+        {"output_margin": True},
+        {"raw_score": True},
+        {"prediction_type": "RawFormulaVal"},
+    ):
+        try:
+            raw_scores_raw = model.predict(model_input, **kwargs)
+            raw_scores_raw = _ensure_numeric_predictions(raw_scores_raw)
+            raw_scores = np.asarray(raw_scores_raw).squeeze()
+            break
+        except TypeError:
+            pass
+        except Exception:
+            logger.debug(
+                "Could not get multiclass raw margins with predict kwargs=%s",
+                kwargs,
+                exc_info=True,
+            )
+
+    if raw_scores is None and hasattr(model, "decision_function"):
+        try:
+            raw_scores_raw = model.decision_function(model_input)
+            raw_scores_raw = _ensure_numeric_predictions(raw_scores_raw)
+            raw_scores = np.asarray(raw_scores_raw).squeeze()
+        except Exception:
+            logger.debug(
+                "Could not get multiclass raw margins with decision_function",
+                exc_info=True,
+            )
+
+    if raw_scores is not None and raw_scores.ndim > 1:
+        raw_scores = raw_scores[0]
+    if raw_scores is not None and raw_scores.ndim == 1 and len(raw_scores) == n_labels:
+        return raw_scores
+    return None
+
+
+def get_xgboost_output_label(model_output=None):
+    """Map explainer model_output to xgboost path summary output label."""
+    if model_output == "logodds":
+        return "logodds"
+    return "margin"
+
+
+def _safe_make_scorer(
+    metric, greater_is_better=True, response_method="predict", **kwargs
+):
+    """Wrapper around make_scorer that handles models without __sklearn_tags__.
+
+    This fixes compatibility issues with CatBoost and other models that don't
+    implement the __sklearn_tags__ attribute required by newer scikit-learn versions.
+    """
+    # Try to create the scorer normally
+    try:
+        scorer = make_scorer(
+            metric,
+            greater_is_better=greater_is_better,
+            response_method=response_method,
+            **kwargs,
+        )
+    except Exception:
+        # If creation fails, create a wrapper scorer
+        scorer = None
+
+    # Create a wrapper that handles __sklearn_tags__ errors when scorer is called
+    def _wrapped_scorer(estimator, X, y_true):
+        try:
+            if scorer is not None:
+                return scorer(estimator, X, y_true)
+        except AttributeError as e:
+            if "__sklearn_tags__" in str(e):
+                # Model doesn't have __sklearn_tags__, call predict/predict_proba directly
+                if response_method == "predict_proba":
+                    n_labels = (
+                        len(estimator.classes_)
+                        if hasattr(estimator, "classes_")
+                        else None
+                    )
+                    y_pred = _predict_proba_with_fallback(
+                        estimator,
+                        X,
+                        n_labels=n_labels,
+                    )
+                else:
+                    y_pred = estimator.predict(X)
+                    y_pred = _ensure_numeric_predictions(y_pred)
+
+                if hasattr(metric, "__call__"):
+                    score = metric(y_true, y_pred)
+                else:
+                    from sklearn.metrics import get_scorer
+
+                    scorer_obj = get_scorer(metric)
+                    score = scorer_obj._score_func(y_true, y_pred)
+
+                return score if greater_is_better else -score
+            raise
+
+        # If scorer creation failed, use direct prediction
+        if scorer is None:
+            if response_method == "predict_proba":
+                n_labels = (
+                    len(estimator.classes_) if hasattr(estimator, "classes_") else None
+                )
+                y_pred = _predict_proba_with_fallback(
+                    estimator,
+                    X,
+                    n_labels=n_labels,
+                )
+            else:
+                y_pred = estimator.predict(X)
+                y_pred = _ensure_numeric_predictions(y_pred)
+
+            if hasattr(metric, "__call__"):
+                score = metric(y_true, y_pred)
+            else:
+                from sklearn.metrics import get_scorer
+
+                scorer_obj = get_scorer(metric)
+                score = scorer_obj._score_func(y_true, y_pred)
+
+            return score if greater_is_better else -score
+
+    return _wrapped_scorer
 
 
 def append_dict_to_df(df: pd.DataFrame, row_dict: dict) -> pd.DataFrame:
@@ -92,6 +462,119 @@ def safe_isinstance(obj, *instance_str):
     return False
 
 
+def unwrap_calibrated_classifier(model):
+    """Return the fitted base estimator for a CalibratedClassifierCV model."""
+    if not safe_isinstance(model, "CalibratedClassifierCV"):
+        return model
+
+    calibrated_classifiers = getattr(model, "calibrated_classifiers_", None)
+    if calibrated_classifiers:
+        calibrated = calibrated_classifiers[0]
+        for attr in ("estimator", "base_estimator"):
+            estimator = getattr(calibrated, attr, None)
+            if estimator is not None:
+                return estimator
+
+    for attr in ("estimator", "base_estimator"):
+        estimator = getattr(model, attr, None)
+        if estimator is not None:
+            return estimator
+
+    return model
+
+
+def align_categorical_dtypes(
+    df_target: pd.DataFrame,
+    df_reference: pd.DataFrame,
+    columns: List[str] | None = None,
+    copy: bool = True,
+) -> pd.DataFrame:
+    """Align categorical/boolean dtypes in df_target to match df_reference."""
+    if df_target is None:
+        return df_target
+    if columns is None:
+        columns = df_target.columns
+    aligned = df_target.copy() if copy else df_target
+    for col in columns:
+        if col not in aligned.columns or col not in df_reference.columns:
+            continue
+        ref_dtype = df_reference[col].dtype
+        if isinstance(ref_dtype, pd.CategoricalDtype):
+            aligned[col] = aligned[col].astype(ref_dtype)
+        elif is_bool_dtype(ref_dtype) and not is_bool_dtype(aligned[col].dtype):
+            aligned[col] = aligned[col].astype(ref_dtype)
+    return aligned
+
+
+def sanitize_categorical_predict_input(
+    df: pd.DataFrame, model, missing_category="NaN"
+) -> pd.DataFrame:
+    """Sanitize categorical prediction input for models with explicit cat feature indices.
+
+    Currently normalizes CatBoost categorical columns so missing values do not crash
+    prediction callbacks.
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    if not safe_isinstance(
+        model, "catboost.core.CatBoost", "CatBoostClassifier", "CatBoostRegressor"
+    ):
+        return df
+
+    get_cat_feature_indices = getattr(model, "get_cat_feature_indices", None)
+    if not callable(get_cat_feature_indices):
+        return df
+
+    cat_feature_indices = list(get_cat_feature_indices() or [])
+    if not cat_feature_indices:
+        return df
+
+    cat_cols = [df.columns[i] for i in cat_feature_indices if 0 <= i < len(df.columns)]
+    if not cat_cols:
+        return df
+
+    sanitized = df.copy()
+
+    def _normalize_cat_value(value):
+        if pd.isna(value):
+            return missing_category
+        if isinstance(value, (float, np.floating)):
+            return str(value)
+        return value
+
+    for col in cat_cols:
+        sanitized[col] = sanitized[col].astype("object").map(_normalize_cat_value)
+
+    return sanitized
+
+
+def sorted_categorical_values(values):
+    """Sort categorical values safely when types are mixed.
+
+    Keeps original values but orders deterministically:
+    booleans, then numbers, then other values by type/value string.
+    """
+
+    def _is_na(value):
+        try:
+            return bool(pd.isna(value))
+        except Exception:
+            return False
+
+    def _sort_key(value):
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, bool):
+            return (0, int(value))
+        if isinstance(value, (int, float)) and not _is_na(value):
+            return (1, float(value))
+        return (2, type(value).__name__, str(value))
+
+    clean_values = [value for value in values if not _is_na(value)]
+    return sorted(clean_values, key=_sort_key)
+
+
 def guess_shap(model):
     """guesses which SHAP explainer to use for a particular model, based
     on str(type(model)). Returns 'tree' for tree based models such as
@@ -105,6 +588,8 @@ def guess_shap(model):
     Returns:
         str: {'tree', 'linear', None}
     """
+    model = unwrap_calibrated_classifier(model)
+
     tree_models = [
         "RandomForestClassifier",
         "RandomForestRegressor",
@@ -191,9 +676,11 @@ def parse_cats(X, cats, sep: str = "_"):
 
     if isinstance(cats, dict):
         for k, v in cats.items():
-            assert set(v).issubset(set(all_cols)), (
-                f"These cats columns for {k} could not be found in X.columns: {set(v) - set(all_cols)}!"
-            )
+            assert set(
+                v
+            ).issubset(
+                set(all_cols)
+            ), f"These cats columns for {k} could not be found in X.columns: {set(v) - set(all_cols)}!"
             col_counter.update(v)
         onehot_dict = cats
     elif isinstance(cats, list):
@@ -203,9 +690,11 @@ def parse_cats(X, cats, sep: str = "_"):
                 col_counter.update(onehot_dict[cat])
             if isinstance(cat, dict):
                 for k, v in cat.items():
-                    assert set(v).issubset(set(all_cols)), (
-                        f"These cats columns for {k} could not be found in X.columns: {set(v) - set(all_cols)}!"
-                    )
+                    assert set(
+                        v
+                    ).issubset(
+                        set(all_cols)
+                    ), f"These cats columns for {k} could not be found in X.columns: {set(v) - set(all_cols)}!"
                     col_counter.update(v)
                     onehot_dict[k] = v
     multi_cols = [v for v, c in col_counter.most_common() if c > 1]
@@ -218,9 +707,9 @@ def parse_cats(X, cats, sep: str = "_"):
         "Please select a different name for your new cats columns!"
     )
     for col, count in col_counter.most_common():
-        assert set(X[col].astype(int).unique()).issubset({0, 1}), (
-            f"{col} is not a onehot encoded column (i.e. has values other than 0, 1)!"
-        )
+        assert is_binary_like_onehot_column(
+            X[col]
+        ), f"{col} is not a onehot encoded column (i.e. has values other than 0, 1)!"
     onehot_cols = list(onehot_dict.keys())
     for col in [col for col in all_cols if col not in col_counter.keys()]:
         onehot_dict[col] = [col]
@@ -262,16 +751,16 @@ def split_pipeline(pipeline: Pipeline, verbose: int = 1):
     )
 
     if verbose:
-        print("splitting pipeline...", flush=True)
+        logger.info("Splitting pipeline...")
         skipped_transforms = [
             name
             for name, transform in pipeline.steps[:-1]
             if not hasattr(transform, "transform")
         ]
         if skipped_transforms:
-            print(
-                f"Skipping the following steps that lack a .transform() method: {', '.join(skipped_transforms)}...",
-                flush=True,
+            logger.info(
+                "Skipping steps that lack a .transform() method: %s",
+                ", ".join(skipped_transforms),
             )
 
     transform_steps = [
@@ -290,8 +779,93 @@ def split_pipeline(pipeline: Pipeline, verbose: int = 1):
     return transformer_pipeline, estimator
 
 
+def is_binary_like_onehot_column(series: pd.Series) -> bool:
+    """Return whether a series behaves like one-hot encoded values.
+
+    Accepts strict {0, 1} columns and binary-like variants with two unique numeric
+    values (e.g. after a scaler was applied to one-hot features in a pipeline).
+    """
+    numeric_unique = np.unique(pd.Series(series).dropna().astype(float))
+    return set(numeric_unique).issubset({0.0, 1.0}) or len(numeric_unique) <= 2
+
+
+def infer_cats_from_transformed_X(
+    X_transformed: pd.DataFrame, original_columns: List[str], sep: str = "_"
+) -> dict:
+    """Infer one-hot groupings from transformed pipeline column names.
+
+    Uses original pre-transform feature names to detect expanded one-hot columns.
+    Only groups columns when:
+    1) more than one transformed column matches an original feature, and
+    2) all matched columns are binary-like.
+    """
+    inferred = {}
+    transformed_columns = list(X_transformed.columns)
+
+    for original_col in original_columns:
+        matched_cols = []
+        for transformed_col in transformed_columns:
+            tail = transformed_col.split("__")[-1]
+            if tail == original_col or tail.startswith(f"{original_col}{sep}"):
+                matched_cols.append(transformed_col)
+
+        if len(matched_cols) <= 1:
+            continue
+        if not all(
+            is_binary_like_onehot_column(X_transformed[col]) for col in matched_cols
+        ):
+            continue
+
+        first_col = matched_cols[0]
+        marker = f"{original_col}{sep}"
+        if marker in first_col:
+            group_name = first_col[: first_col.index(marker) + len(original_col)]
+        else:
+            group_name = original_col
+        inferred[group_name] = matched_cols
+
+    return inferred
+
+
+def rename_pipeline_columns(
+    columns: List[str],
+    strip_pipeline_prefix: bool = False,
+    feature_name_fn: Optional[Callable[[str], str]] = None,
+    verbose: int = 1,
+) -> List[str]:
+    """Optionally transform pipeline output feature names."""
+    if feature_name_fn is not None:
+        renamed = [feature_name_fn(col) for col in columns]
+    elif strip_pipeline_prefix:
+        renamed = [col.split("__", 1)[1] if "__" in col else col for col in columns]
+    else:
+        return columns
+
+    if len(set(renamed)) == len(renamed):
+        return renamed
+
+    deduped = []
+    counts = Counter()
+    for col in renamed:
+        counts[col] += 1
+        if counts[col] == 1:
+            deduped.append(col)
+        else:
+            deduped.append(f"{col}__{counts[col]}")
+
+    if verbose:
+        logger.warning(
+            "Feature name transformation produced duplicate columns; appended numeric suffixes to keep names unique."
+        )
+    return deduped
+
+
 def get_transformed_X(
-    transformer_pipeline: Pipeline, X: pd.DataFrame, verbose: int = 1
+    transformer_pipeline: Pipeline,
+    X: pd.DataFrame,
+    verbose: int = 1,
+    strip_pipeline_prefix: bool = False,
+    feature_name_fn: Optional[Callable[[str], str]] = None,
 ):
     """takes a transformer_pipeline (all the steps except the final Estimator of an sklearn or imblearn Pipeline)
     and uses it to transform input DataFrame X and returns a transformed DataFrame.
@@ -317,40 +891,62 @@ def get_transformed_X(
                     f"len(pipeline[:-1].get_feature_names_out())={len(columns)} does"
                     f" not equal X_transformed.shape[1]={X_transformed.shape[1]}!"
                 )
-            return pd.DataFrame(X_transformed, columns=columns)
+            columns = rename_pipeline_columns(
+                columns,
+                strip_pipeline_prefix=strip_pipeline_prefix,
+                feature_name_fn=feature_name_fn,
+                verbose=verbose,
+            )
+            return pd.DataFrame(X_transformed, columns=columns, index=X.index)
         except Exception as e:
             if verbose:
-                print(
-                    f"Failed to retrieve new column names from transformer_pipeline.get_feature_names_out()! Error: {e}"
+                logger.warning(
+                    "Failed to retrieve new column names from transformer_pipeline.get_feature_names_out(): %s",
+                    e,
                 )
 
     if X_transformed.shape == X.values.shape:
         if verbose:
-            print(
-                "transformer pipeline outputs a DataFrame with the same number of columns"
-                f"so trying to assign column names from X.columns: {X.columns.tolist()}, so"
-                " make sure that your pipeline does not add, remove or reorders columns!",
-                flush=True,
+            logger.info(
+                "Transformer pipeline outputs same number of columns; using X.columns (%s). "
+                "Ensure your pipeline does not add/remove/reorder columns.",
+                X.columns.tolist(),
             )
         try:
             for i, pipe in enumerate(transformer_pipeline):
                 if hasattr(pipe, "n_features_in_"):
                     assert pipe.n_features_in_ == len(X.columns)
-            return pd.DataFrame(X_transformed, columns=X.columns)
+            return pd.DataFrame(X_transformed, columns=X.columns, index=X.index)
         except Exception as e:
-            print(
-                f".n_features_in_ did not match len(X.columns)={len(X.columns)} for pipeline step {i}: {pipe}! Error: {e}"
+            logger.warning(
+                ".n_features_in_ did not match len(X.columns)=%s for pipeline step %s: %s. Error: %s",
+                len(X.columns),
+                i,
+                pipe,
+                e,
             )
 
     if verbose:
-        print(
+        logger.warning(
             "Pipeline does not have a functioning .get_feature_names_out() method, "
             "nor do all pipeline steps return the same number of columns as input, "
-            "so assigning columns names 'col1', 'col2', etc instead!"
+            "so assigning column names 'col1', 'col2', etc."
         )
     columns = [f"col{i + 1}" for i in range(X_transformed.shape[1])]
 
-    return pd.DataFrame(X_transformed, columns=columns)
+    return pd.DataFrame(X_transformed, columns=columns, index=X.index)
+
+
+def build_pipeline_extraction_warning(error: Exception) -> str:
+    """Build a user-facing warning when pipeline extraction fails."""
+    return (
+        "Warning: Failed to extract a data transformer with column names and final "
+        "model from the Pipeline. So set shap='kernel' to use the (slower and "
+        "approximate) model-agnostic shap.KernelExplainer instead. "
+        "If possible, ensure pipeline transformers implement get_feature_names_out(), "
+        "and verify pipeline transform() can run on the provided X/X_background. "
+        f"Error: {error}"
+    )
 
 
 def retrieve_onehot_value(
@@ -568,8 +1164,11 @@ def make_one_vs_all_scorer(metric, pos_label=1, greater_is_better=True):
 
     def _scorer(clf, X, y):
         warnings.filterwarnings("ignore", category=UserWarning)
-        y_pred = clf.predict_proba(X)
+        n_labels = len(clf.classes_) if hasattr(clf, "classes_") else None
+        y_pred = _predict_proba_with_fallback(clf, X, n_labels=n_labels)
         warnings.filterwarnings("default", category=UserWarning)
+        y_pred = _ensure_numeric_predictions(y_pred)
+        y_pred = np.asarray(y_pred)
         score = sign * partial_metric(y, y_pred)
         return score
 
@@ -623,13 +1222,13 @@ def permutation_importances(
         onehot_dict = {col: [col] for col in X.columns}
 
     if isinstance(metric, str):
-        scorer = make_scorer(
+        scorer = _safe_make_scorer(
             metric,
             greater_is_better=greater_is_better,
             response_method="predict_proba" if needs_proba else "predict",
         )
     elif not needs_proba or pos_label is None:
-        scorer = make_scorer(
+        scorer = _safe_make_scorer(
             metric, greater_is_better=greater_is_better, response_method="predict"
         )
     else:
@@ -654,7 +1253,9 @@ def permutation_importances(
         scores = []
         for i in range(n_repeats):
             old_cols = X[col_list].copy()
-            X[col_list] = np.random.permutation(X[col_list])
+            permuted = X[col_list].sample(frac=1, replace=False)
+            permuted.index = X.index
+            X[col_list] = permuted
             if pass_nparray:
                 scores.append(scorer(model, X.values, y.values))
             else:
@@ -890,10 +1491,36 @@ def get_pdp_df(
             skorch models)
     """
 
+    def _model_input(data):
+        if isinstance(data, pd.DataFrame):
+            data = sanitize_categorical_predict_input(data, model)
+
+        if cast_to_float32:
+            if isinstance(data, pd.DataFrame):
+                return data.values.astype("float32")
+            return np.asarray(data, dtype="float32")
+        if (
+            isinstance(data, pd.DataFrame)
+            and not safe_isinstance(
+                model,
+                "catboost.core.CatBoost",
+                "CatBoostClassifier",
+                "CatBoostRegressor",
+            )
+            and not safe_isinstance(
+                model, "sklearn.pipeline.Pipeline", "imblearn.pipeline.Pipeline"
+            )
+            and not hasattr(model, "feature_names_in_")
+        ):
+            return data.values
+        return data
+
     if grid_values is None:
         if isinstance(feature, str):
             if not is_numeric_dtype(X_sample[feature]):
-                grid_values = sorted(X_sample[feature].unique().tolist())
+                grid_values = sorted_categorical_values(
+                    X_sample[feature].unique().tolist()
+                )
             else:
                 grid_values = get_grid_points(
                     X_sample[feature],
@@ -910,12 +1537,12 @@ def get_pdp_df(
             )
 
     if is_classifier:
-        if cast_to_float32:
-            first_row = X_sample.iloc[[0]].values.astype("float32")
-        else:
-            first_row = X_sample.iloc[[0]]
+        first_row = _model_input(X_sample.iloc[[0]])
         warnings.filterwarnings("ignore", category=UserWarning)
-        n_labels = model.predict_proba(first_row).shape[1]
+        class_count = len(model.classes_) if hasattr(model, "classes_") else None
+        n_labels = _predict_proba_with_fallback(
+            model, first_row, n_labels=class_count
+        ).shape[1]
         warnings.filterwarnings("default", category=UserWarning)
         if multiclass:
             pdp_dfs = [pd.DataFrame() for i in range(n_labels)]
@@ -923,6 +1550,14 @@ def get_pdp_df(
             pdp_df = pd.DataFrame()
     else:
         pdp_df = pd.DataFrame()
+
+    def _coerce_value(value, dtype):
+        if isinstance(dtype, pd.CategoricalDtype):
+            return value
+        if is_bool_dtype(dtype):
+            return bool(value)
+        return value
+
     for grid_value in grid_values:
         dtemp = X_sample.copy()
         if isinstance(feature, list):
@@ -931,22 +1566,31 @@ def get_pdp_df(
                     f"{grid_values} When passing a list of features these have to be onehotencoded!"
                     f"But X_sample['{grid_value}'].unique()=={list(set(X_sample[grid_value].unique()))}"
                 )
-            dtemp.loc[:, feature] = [1 if col == grid_value else 0 for col in feature]
+            for col in feature:
+                dtemp[col] = _coerce_value(col == grid_value, X_sample[col].dtype)
         else:
-            dtemp[[feature]] = grid_value
+            dtemp[[feature]] = _coerce_value(grid_value, X_sample[feature].dtype)
+        align_cols = feature if isinstance(feature, list) else [feature]
+        dtemp = align_categorical_dtypes(
+            dtemp, X_sample, columns=align_cols, copy=False
+        )
         if is_classifier:
-            if cast_to_float32:
-                dtemp = dtemp.values.astype("float32")
-            pred_probas = model.predict_proba(dtemp).squeeze()
+            dtemp_model = _model_input(dtemp)
+            pred_probas = _predict_proba_with_fallback(
+                model,
+                dtemp_model,
+                n_labels=n_labels,
+            ).squeeze()
             if multiclass:
                 for i in range(n_labels):
                     pdp_dfs[i][grid_value] = pred_probas[:, i]
             else:
                 pdp_df[grid_value] = pred_probas[:, pos_label]
         else:
-            if cast_to_float32:
-                dtemp = dtemp.values.astype("float32")
-            preds = model.predict(dtemp).squeeze()
+            dtemp_model = _model_input(dtemp)
+            preds_raw = model.predict(dtemp_model)
+            preds_raw = _ensure_numeric_predictions(preds_raw)
+            preds = np.asarray(preds_raw).squeeze()
             pdp_df[grid_value] = preds
     if multiclass:
         return pdp_dfs
@@ -1206,12 +1850,12 @@ def get_contrib_df(
     Returns:
         pd.DataFrame with columns=['col', 'contribution', 'value', 'cumulative', 'base']
     """
-    assert isinstance(X_row, pd.DataFrame), (
-        "X_row should be a pd.DataFrame! Use X.iloc[[index]]"
-    )
+    assert isinstance(
+        X_row, pd.DataFrame
+    ), "X_row should be a pd.DataFrame! Use X.iloc[[index]]"
     assert (
         len(X_row.iloc[[0]].values[0].shape) == 1
-    ), """X is not the right shape: len(X.values[0]) should be 1. 
+    ), """X is not the right shape: len(X.values[0]) should be 1.
             Try passing X.iloc[[index]]"""
     assert sort in {"abs", "high-to-low", "low-to-high", "importance", None}
 
@@ -1238,7 +1882,10 @@ def get_contrib_df(
 
         display_df_neg = display_df[display_df.contribution < 0]
         display_df_pos = display_df[display_df.contribution >= 0]
-        print(contrib_df[~contrib_df.col.isin(display_df.col.tolist())])
+        logger.debug(
+            "Excluded contributions: %s",
+            contrib_df[~contrib_df.col.isin(display_df.col.tolist())],
+        )
 
         rest_df = pd.DataFrame(
             {
@@ -1401,7 +2048,7 @@ def normalize_shap_interaction_values(shap_interaction_values, shap_values=None)
     return siv
 
 
-def get_decisionpath_df(decision_tree, observation, pos_label=1):
+def get_decisionpath_df(decision_tree, observation, pos_label=1, class_names=None):
     """summarize the path through a DecisionTree for a specific observation.
 
     Args:
@@ -1409,12 +2056,25 @@ def get_decisionpath_df(decision_tree, observation, pos_label=1):
             a fitted DecisionTree model.
         observation ([type]): single row of data to display tree path for.
         pos_label (int, optional): label of positive class. Defaults to 1.
+        class_names (list, optional): List of class names for mapping pos_label to class values.
+            Defaults to None.
 
     Returns:
         pd.DataFrame: columns=['node_id', 'average', 'feature',
             'value', 'split', 'direction', 'left', 'right', 'diff']
     """
-    nodes = decision_tree.predict_path(observation)
+    # Convert observation to numpy array for dtreeviz's predict_path
+    # dtreeviz internally accesses by integer index (node.feature() returns int)
+    if isinstance(observation, pd.Series):
+        observation_array = observation.values
+    elif isinstance(observation, pd.DataFrame):
+        observation_array = (
+            observation.values[0] if len(observation) == 1 else observation.values
+        )
+    else:
+        observation_array = np.asarray(observation)
+
+    nodes = decision_tree.predict_path(observation_array)
 
     decisiontree_df = pd.DataFrame(
         columns=[
@@ -1432,25 +2092,73 @@ def get_decisionpath_df(decision_tree, observation, pos_label=1):
     if decision_tree.is_classifier():
 
         def node_pred_proba(node):
-            return node.class_counts()[pos_label] / sum(node.class_counts())
+            class_counts_raw = node.class_counts()
+            # Handle both dict and numpy array return types from class_counts()
+            # Newer dtreeviz versions may return numpy arrays instead of dicts
+            if isinstance(class_counts_raw, dict):
+                class_counts = class_counts_raw
+                total = sum(class_counts.values())
+                if total == 0:
+                    return 0.0
+
+                # Try direct access first (most common case)
+                if pos_label in class_counts:
+                    return class_counts[pos_label] / total
+
+                # If pos_label not found, try to map it to available class keys
+                available_classes = sorted_categorical_values(class_counts.keys())
+                if len(available_classes) == 0:
+                    return 0.0
+
+                # Map pos_label (index in labels) to actual class value
+                if 0 <= pos_label < len(available_classes):
+                    class_key = available_classes[pos_label]
+                    return class_counts[class_key] / total
+
+                # If pos_label is out of range, clamp it to valid range
+                if pos_label >= len(available_classes):
+                    class_key = available_classes[-1]
+                    return class_counts[class_key] / total
+
+                # Final fallback: use the class with the highest count
+                class_key = max(class_counts, key=class_counts.get)
+                return class_counts[class_key] / total
+            else:
+                # Handle numpy array case (newer dtreeviz versions)
+                class_counts_array = np.asarray(class_counts_raw)
+                total = class_counts_array.sum()
+                if total == 0:
+                    return 0.0
+
+                # pos_label is an index into the array
+                if 0 <= pos_label < len(class_counts_array):
+                    return float(class_counts_array[pos_label]) / total
+                elif len(class_counts_array) > 0:
+                    # Clamp to valid range
+                    return float(class_counts_array[-1]) / total
+                return 0.0
 
         for node in nodes:
             if not node.isleaf():
+                # Use node.feature() (integer index) to access observation_array
+                # Use node.feature_name() (string) for display
+                feature_idx = node.feature()
+                feature_value = observation_array[feature_idx]
                 decisiontree_df = append_dict_to_df(
                     decisiontree_df,
                     {
                         "node_id": node.id,
                         "average": node_pred_proba(node),
                         "feature": node.feature_name(),
-                        "value": observation[node.feature_name()],
+                        "value": feature_value,
                         "split": node.split(),
                         "direction": "left"
-                        if observation[node.feature_name()] < node.split()
+                        if feature_value < node.split()
                         else "right",
                         "left": node_pred_proba(node.left),
                         "right": node_pred_proba(node.right),
                         "diff": node_pred_proba(node.left) - node_pred_proba(node)
-                        if observation[node.feature_name()] < node.split()
+                        if feature_value < node.split()
                         else node_pred_proba(node.right) - node_pred_proba(node),
                     },
                 )
@@ -1458,25 +2166,36 @@ def get_decisionpath_df(decision_tree, observation, pos_label=1):
     else:
 
         def node_mean(node):
-            return decision_tree.tree_model.tree_.value[node.id].item()
+            try:
+                return decision_tree.tree_model.tree_.value[node.id].item()
+            except Exception:
+                node_samples = decision_tree.get_node_samples()
+                sample_idxs = node_samples.get(node.id, [])
+                if len(sample_idxs) == 0:
+                    return np.nan
+                return float(np.asarray(decision_tree.y_train)[sample_idxs].mean())
 
         for node in nodes:
             if not node.isleaf():
+                # Use node.feature() (integer index) to access observation_array
+                # Use node.feature_name() (string) for display
+                feature_idx = node.feature()
+                feature_value = observation_array[feature_idx]
                 decisiontree_df = append_dict_to_df(
                     decisiontree_df,
                     {
                         "node_id": node.id,
                         "average": node_mean(node),
                         "feature": node.feature_name(),
-                        "value": observation[node.feature_name()],
+                        "value": feature_value,
                         "split": node.split(),
                         "direction": "left"
-                        if observation[node.feature_name()] < node.split()
+                        if feature_value < node.split()
                         else "right",
                         "left": node_mean(node.left),
                         "right": node_mean(node.right),
                         "diff": node_mean(node.left) - node_mean(node)
-                        if observation[node.feature_name()] < node.split()
+                        if feature_value < node.split()
                         else node_mean(node.right) - node_mean(node),
                     },
                 )
@@ -1726,22 +2445,40 @@ def get_xgboost_preds_df(xgbmodel, X_row, pos_label=1):
         is_classifier = True
         n_classes = len(xgbmodel.classes_)
         if n_classes == 2:
+            base_score_raw = xgbmodel.get_params()["base_score"]
+            base_score_raw = (
+                _ensure_numeric_predictions(base_score_raw)
+                if base_score_raw is not None
+                else None
+            )
             if pos_label == 1:
-                base_proba = xgbmodel.get_params()["base_score"] or 0.5
+                base_proba = (
+                    float(base_score_raw) if base_score_raw is not None else 0.5
+                )
             elif pos_label == 0:
-                base_proba = 1 - xgbmodel.get_params()["base_score"] or 0.5
+                base_proba = 1 - (
+                    float(base_score_raw) if base_score_raw is not None else 0.5
+                )
             else:
                 raise ValueError("pos_label should be either 0 or 1!")
             n_trees = len(xgbmodel.get_booster().get_dump())
             base_score = np.log(base_proba / (1 - base_proba))
         else:
             base_proba = 1.0 / n_classes
-            base_score = xgbmodel.get_params()["base_score"]
+            base_score_raw = xgbmodel.get_params()["base_score"]
+            base_score_raw = (
+                _ensure_numeric_predictions(base_score_raw)
+                if base_score_raw is not None
+                else None
+            )
+            base_score = float(base_score_raw) if base_score_raw is not None else 0.5
             n_trees = int(len(xgbmodel.get_booster().get_dump()) / n_classes)
 
     elif str(type(xgbmodel)).endswith("XGBRegressor'>"):
         is_classifier = False
-        base_score = xgbmodel.get_params()["base_score"]
+        base_score_raw = xgbmodel.get_params()["base_score"]
+        base_score_raw = _ensure_numeric_predictions(base_score_raw)
+        base_score = float(base_score_raw) if base_score_raw is not None else 0.5
         n_trees = len(xgbmodel.get_booster().get_dump())
     else:
         raise ValueError("Pass either an XGBClassifier or XGBRegressor!")
@@ -1749,37 +2486,63 @@ def get_xgboost_preds_df(xgbmodel, X_row, pos_label=1):
     if is_classifier:
         if n_classes == 2:
             if pos_label == 1:
-                preds = [
+                preds_raw = [
                     xgbmodel.predict(
                         X_row, iteration_range=(0, i + 1), output_margin=True
                     )[0]
                     for i in range(n_trees)
                 ]
             elif pos_label == 0:
-                preds = [
+                preds_raw = [
                     -xgbmodel.predict(
                         X_row, iteration_range=(0, i + 1), output_margin=True
                     )[0]
                     for i in range(n_trees)
                 ]
+            # Convert XGBoost 3.0+ string predictions to numeric
+            preds = []
+            for p in preds_raw:
+                p_conv = _ensure_numeric_predictions(p)
+                if isinstance(p_conv, np.ndarray):
+                    p_conv = p_conv.item() if p_conv.ndim == 0 else float(p_conv[0])
+                preds.append(float(p_conv))
             pred_probas = (np.exp(preds) / (1 + np.exp(preds))).tolist()
         else:
-            margins = [
+            margins_raw = [
                 xgbmodel.predict(X_row, iteration_range=(0, i + 1), output_margin=True)[
                     0
                 ]
                 for i in range(n_trees)
             ]
+            # Convert XGBoost 3.0+ string predictions to numeric
+            margins = []
+            for m in margins_raw:
+                m_conv = _ensure_numeric_predictions(m)
+                if isinstance(m_conv, np.ndarray):
+                    margins.append(m_conv)
+                elif isinstance(m_conv, (list, tuple)):
+                    margins.append(
+                        np.asarray([_ensure_numeric_predictions(x) for x in m_conv])
+                    )
+                else:
+                    margins.append(np.asarray([float(m_conv)]))
             preds = [margin[pos_label] for margin in margins]
             pred_probas = [
                 (np.exp(margin) / np.exp(margin).sum())[pos_label] for margin in margins
             ]
 
     else:
-        preds = [
+        preds_raw = [
             xgbmodel.predict(X_row, iteration_range=(0, i + 1), output_margin=True)[0]
             for i in range(n_trees)
         ]
+        # Convert XGBoost 3.0+ string predictions to numeric
+        preds = []
+        for p in preds_raw:
+            p_conv = _ensure_numeric_predictions(p)
+            if isinstance(p_conv, np.ndarray):
+                p_conv = p_conv.item() if p_conv.ndim == 0 else float(p_conv[0])
+            preds.append(float(p_conv))
 
     xgboost_preds_df = pd.DataFrame(
         dict(tree=range(-1, n_trees), pred=[base_score] + preds)
@@ -1794,3 +2557,93 @@ def get_xgboost_preds_df(xgbmodel, X_row, pos_label=1):
             0, "pred_proba"
         ]
     return xgboost_preds_df
+
+
+def get_lgbm_preds_df(lgbmodel, X_row, pos_label=1):
+    """Returns cumulative per-tree predictions for a LightGBM model.
+
+    Args:
+        lgbmodel: fitted LightGBM sklearn-compatible model
+            (i.e. LGBMClassifier or LGBMRegressor)
+        X_row: a single row of data, e.g X_train.iloc[0]
+        pos_label: for classifier the label to be used as positive label
+            Defaults to 1.
+
+    Returns:
+        pd.DataFrame
+    """
+    if safe_isinstance(lgbmodel, "lightgbm.sklearn.LGBMClassifier"):
+        is_classifier = True
+        n_classes = len(lgbmodel.classes_)
+        n_trees = lgbmodel.booster_.num_trees()
+        if n_classes > 2:
+            n_trees = int(n_trees / n_classes)
+    elif safe_isinstance(lgbmodel, "lightgbm.sklearn.LGBMRegressor"):
+        is_classifier = False
+        n_trees = lgbmodel.booster_.num_trees()
+    else:
+        raise ValueError("Pass either an LGBMClassifier or LGBMRegressor!")
+
+    if is_classifier:
+        if n_classes == 2:
+            if pos_label not in (0, 1):
+                raise ValueError("pos_label should be either 0 or 1!")
+
+            margins = []
+            for i in range(1, n_trees + 1):
+                margin_raw = lgbmodel.predict(X_row, raw_score=True, num_iteration=i)[0]
+                margin_raw = _ensure_numeric_predictions(margin_raw)
+                if isinstance(margin_raw, np.ndarray):
+                    margin_raw = (
+                        margin_raw.item()
+                        if margin_raw.ndim == 0
+                        else float(margin_raw[0])
+                    )
+                margin = float(margin_raw)
+                margins.append(margin if pos_label == 1 else -margin)
+
+            pred_probas = (np.exp(margins) / (1 + np.exp(margins))).tolist()
+            base_score = 0.0
+            base_proba = 0.5
+            preds = margins
+        else:
+            if pos_label < 0 or pos_label >= n_classes:
+                raise ValueError(
+                    f"pos_label={pos_label}, but should be >= 0 and <= {n_classes - 1}!"
+                )
+            margins = []
+            for i in range(1, n_trees + 1):
+                margin_raw = lgbmodel.predict(X_row, raw_score=True, num_iteration=i)[0]
+                margin_raw = _ensure_numeric_predictions(margin_raw)
+                margin = np.asarray(margin_raw, dtype=float)
+                margins.append(margin)
+
+            preds = [float(margin[pos_label]) for margin in margins]
+            pred_probas = [
+                float((np.exp(margin) / np.exp(margin).sum())[pos_label])
+                for margin in margins
+            ]
+            base_score = 0.0
+            base_proba = 1.0 / n_classes
+    else:
+        preds = []
+        for i in range(1, n_trees + 1):
+            pred_raw = lgbmodel.predict(X_row, raw_score=True, num_iteration=i)[0]
+            pred_raw = _ensure_numeric_predictions(pred_raw)
+            if isinstance(pred_raw, np.ndarray):
+                pred_raw = pred_raw.item() if pred_raw.ndim == 0 else float(pred_raw[0])
+            preds.append(float(pred_raw))
+        base_score = 0.0
+
+    lgbm_preds_df = pd.DataFrame(
+        dict(tree=range(-1, n_trees), pred=[base_score] + preds)
+    )
+    lgbm_preds_df["pred_diff"] = lgbm_preds_df.pred.diff()
+    lgbm_preds_df.loc[0, "pred_diff"] = lgbm_preds_df.loc[0, "pred"]
+
+    if is_classifier:
+        lgbm_preds_df["pred_proba"] = [base_proba] + pred_probas
+        lgbm_preds_df["pred_proba_diff"] = lgbm_preds_df.pred_proba.diff()
+        lgbm_preds_df.loc[0, "pred_proba_diff"] = lgbm_preds_df.loc[0, "pred_proba"]
+
+    return lgbm_preds_df

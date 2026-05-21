@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 
@@ -129,7 +128,9 @@ def test_multiclass_calculate_properties(precalculated_rf_multiclass_explainer):
     precalculated_rf_multiclass_explainer.calculate_properties()
 
 
-def test_multiclass_shap_interaction_values_by_col(precalculated_rf_multiclass_explainer):
+def test_multiclass_shap_interaction_values_by_col(
+    precalculated_rf_multiclass_explainer,
+):
     assert isinstance(
         precalculated_rf_multiclass_explainer.shap_interaction_values_for_col("Age"),
         np.ndarray,
@@ -273,7 +274,6 @@ def test_multiclass_pred_probas(precalculated_rf_multiclass_explainer):
     assert isinstance(precalculated_rf_multiclass_explainer.pred_probas(), np.ndarray)
 
 
-
 def test_multiclass_precision_df(precalculated_rf_multiclass_explainer):
     assert isinstance(
         precalculated_rf_multiclass_explainer.get_precision_df(), pd.DataFrame
@@ -299,7 +299,6 @@ def test_multiclass_keep_shap_pos_label_only(precalculated_rf_multiclass_explain
     assert isinstance(
         precalculated_rf_multiclass_explainer.get_shap_values_df(), pd.DataFrame
     )
-
 
 
 def test_multiclass_plot_precision(precalculated_rf_multiclass_explainer):
@@ -351,8 +350,6 @@ def test_multiclass_plot_confusion_matrix(precalculated_rf_multiclass_explainer)
     assert isinstance(fig, go.Figure)
 
 
-
-
 def test_multiclass_plot_lift_curve(precalculated_rf_multiclass_explainer):
     fig = precalculated_rf_multiclass_explainer.plot_lift_curve()
     assert isinstance(fig, go.Figure)
@@ -398,3 +395,41 @@ def test_multiclass_plot_pr_auc(precalculated_rf_multiclass_explainer):
 
     fig = precalculated_rf_multiclass_explainer.plot_pr_auc(1.0)
     assert isinstance(fig, go.Figure)
+
+
+def test_multiclass_logodds_consistent_between_prediction_and_contributions(
+    precalculated_xgb_multiclass_explainer,
+):
+    index = 0
+    pred_df = precalculated_xgb_multiclass_explainer.prediction_result_df(
+        index=index, logodds=True, round=12
+    )
+
+    for pos_label in range(len(precalculated_xgb_multiclass_explainer.labels)):
+        contrib_df = precalculated_xgb_multiclass_explainer.get_contrib_df(
+            index=index, pos_label=pos_label
+        )
+        predicted_from_contrib = float(
+            contrib_df.loc[contrib_df.col == "_PREDICTION", "contribution"].iloc[0]
+        )
+        predicted_logodds = float(pred_df.loc[pos_label, "logodds"])
+        assert np.isclose(predicted_from_contrib, predicted_logodds)
+
+
+def test_multiclass_logodds_pdp_highlight_matches_contributions(
+    precalculated_xgb_multiclass_explainer,
+):
+    index = 0
+    for pos_label in range(len(precalculated_xgb_multiclass_explainer.labels)):
+        _, pdp_prediction = (
+            precalculated_xgb_multiclass_explainer.get_col_value_plus_prediction(
+                "Age", index=index, pos_label=pos_label
+            )
+        )
+        contrib_df = precalculated_xgb_multiclass_explainer.get_contrib_df(
+            index=index, pos_label=pos_label
+        )
+        predicted_from_contrib = float(
+            contrib_df.loc[contrib_df.col == "_PREDICTION", "contribution"].iloc[0]
+        )
+        assert np.isclose(float(pdp_prediction), predicted_from_contrib)
